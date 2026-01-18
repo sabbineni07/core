@@ -1,567 +1,251 @@
-"""
-Workflow Metrics Collector
-
-Extracts workflow execution metrics from Databricks system tables.
-
-Uses:
-- system.lakeflow.job_run_timeline: Job run execution data
-- system.lakeflow.job_task_run_timeline: Task run execution data
-- system.compute.node_timeline: Node-level resource utilization (CPU, memory, network, disk)
-
-References:
-- Jobs tables: https://learn.microsoft.com/en-us/azure/databricks/admin/system-tables/jobs
-- Compute tables: https://learn.microsoft.com/en-us/azure/databricks/admin/system-tables/compute
-
-Note: node_timeline columns per documentation:
-- CPU: cpu_user_percent, cpu_system_percent, cpu_wait_percent (total = sum of all three)
-- Memory: mem_used_percent
-- Network: network_sent_bytes, network_received_bytes
-- Disk: disk_free_bytes_per_mount_point (map structure)
-- No direct job_id - must join via cluster_id from job_run_timeline
-"""
-
-from dataclasses import dataclass
-from typing import List, Dict, Optional
-from datetime import datetime, timedelta
-from databricks import sql
-
-
-@dataclass
-class WorkflowMetrics:
-    """Workflow execution metrics"""
-    workflow_id: str
-    workflow_name: str
-    execution_id: str
-    start_time: datetime
-    end_time: Optional[datetime]
-    duration_seconds: Optional[float]
-    status: str
-    task_count: int
-    total_cpu_time: float
-    total_memory_gb_hours: float
-    total_dbu_consumed: float
-    avg_cpu_utilization: float
-    avg_memory_utilization: float
-    max_nodes_used: int
-    min_nodes_used: int
-    rows_processed: Optional[int] = None
-
-
-@dataclass
-class ResourceUtilization:
-    """Resource provisioned vs consumed vs utilized metrics"""
-    workspace_id: str
-    job_id: Optional[str]
-    date: str  # YYYY-MM-DD format
-    # Provisioned (configured maximum)
-    total_cpus_provisioned: float
-    total_memory_gb_provisioned: float
-    max_nodes_provisioned: int
-    # Consumed (actually running/paid for)
-    avg_cpus_consumed: float
-    avg_memory_gb_consumed: float
-    avg_nodes_consumed: float
-    # Utilized (actually used from consumed)
-    avg_cpus_utilized: float
-    avg_memory_gb_utilized: float
-    # Efficiency metrics
-    provisioning_efficiency_pct: float  # (consumed / provisioned) * 100
-    cpu_utilization_efficiency_pct: float  # (utilized / consumed) * 100
-    memory_utilization_efficiency_pct: float  # (utilized / consumed) * 100
-    # Legacy metrics for backward compatibility (utilized / provisioned)
-    cpu_utilization_pct: float
-    memory_utilization_pct: float
-
-
-class WorkflowMetricsCollector:
-    """Collects workflow execution metrics from Databricks system tables"""
-    
-    def __init__(self, connection_params: Dict):
-        """
-        Initialize collector with connection parameters
-        
-        Args:
-            connection_params: Databricks connection parameters
-        """
-        self.connection_params = connection_params
-    
-    def collect_workflow_metrics(
-        self, 
-        start_date: datetime, 
-        end_date: datetime,
-        workflow_ids: Optional[List[str]] = None
-    ) -> List[WorkflowMetrics]:
-        """
-        Collect workflow execution metrics for specified time period
-        
-        Args:
-            start_date: Start date for metrics collection
-            end_date: End date for metrics collection
-            workflow_ids: Optional list of workflow IDs to filter
-            
-        Returns:
-            List of WorkflowMetrics objects
-        """
-        query = self._build_workflow_metrics_query(start_date, end_date, workflow_ids)
-        
-        with sql.connect(**self.connection_params) as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(query)
-                results = cursor.fetchall()
-                
-        return [self._parse_workflow_metrics(row) for row in results]
-    
-    def _build_workflow_metrics_query(
-        self, 
-        start_date: datetime, 
-        end_date: datetime,
-        workflow_ids: Optional[List[str]]
-    ) -> str:
-        """Build SQL query for workflow metrics"""
-        
-        workflow_filter = ""
-        if workflow_ids:
-            workflow_ids_str = "', '".join(workflow_ids)
-            workflow_filter = f"AND job_id IN ('{workflow_ids_str}')"
-        
-        query = f"""
-        WITH workflow_executions AS (
-            SELECT 
-                workspace_id,
-                job_id,
-                job_run_id,
-                -- Extract cluster_id from compute_ids array (first element if available)
-                -- Note: job_run_timeline uses compute_ids array, not direct cluster_id column
-                compute_ids[0] AS cluster_id,
-                period_start_time AS start_time,
-                period_end_time AS end_time,
-                result_state AS status,
-                TIMESTAMPDIFF(SECOND, period_start_time, period_end_time) AS duration_seconds
-            FROM system.lakeflow.job_run_timeline
-            WHERE period_start_time >= '{start_date.isoformat()}'
-                AND period_start_time < '{end_date.isoformat()}'
-                AND size(compute_ids) > 0  -- Only include runs with compute
-                {workflow_filter}
-        ),
-        task_metrics AS (
-            SELECT 
-                jr.job_id,
-                jr.job_run_id,
-                COUNT(DISTINCT tr.task_key) AS task_count,
-                SUM(TIMESTAMPDIFF(SECOND, tr.period_start_time, tr.period_end_time)) AS total_cpu_time
-            FROM system.lakeflow.job_task_run_timeline tr
-            INNER JOIN workflow_executions jr 
-                ON tr.job_id = jr.job_id AND tr.job_run_id = jr.job_run_id
-            WHERE tr.period_end_time IS NOT NULL
-            GROUP BY jr.job_id, jr.job_run_id
-        ),
-        -- Node metrics from system.compute.node_timeline
-        -- Reference: https://learn.microsoft.com/en-us/azure/databricks/admin/system-tables/compute
-        -- Note: node_timeline has cluster_id, not job_id, so we join via cluster_id from job_run_timeline
-        node_metrics AS (
-            SELECT 
-                we.job_id,
-                we.job_run_id,
-                -- Total CPU = cpu_user_percent + cpu_system_percent + cpu_wait_percent
-                AVG(COALESCE(nt.cpu_user_percent, 0) + 
-                    COALESCE(nt.cpu_system_percent, 0) + 
-                    COALESCE(nt.cpu_wait_percent, 0)) AS avg_cpu_utilization,
-                AVG(COALESCE(nt.mem_used_percent, 0)) AS avg_memory_utilization,
-                MAX(COALESCE(nt.cpu_user_percent, 0) + 
-                    COALESCE(nt.cpu_system_percent, 0) + 
-                    COALESCE(nt.cpu_wait_percent, 0)) AS peak_cpu_utilization,
-                MAX(COALESCE(nt.mem_used_percent, 0)) AS peak_memory_utilization,
-                MAX(node_count_by_period.node_count) AS max_nodes_used,
-                MIN(node_count_by_period.node_count) AS min_nodes_used,
-                AVG(COALESCE(nt.network_sent_bytes, 0) + COALESCE(nt.network_received_bytes, 0)) AS avg_network_io_bytes
-            FROM system.compute.node_timeline nt
-            INNER JOIN workflow_executions we 
-                ON nt.cluster_id = we.cluster_id
-                AND nt.start_time >= we.start_time
-                AND (we.end_time IS NULL OR nt.end_time <= we.end_time)
-            INNER JOIN (
+query = f"""
+        WITH resource_utilization_base AS (
+            WITH job_runs AS (
                 SELECT 
-                    cluster_id,
-                    start_time,
-                    COUNT(DISTINCT instance_id) AS node_count
-                FROM system.compute.node_timeline
-                GROUP BY cluster_id, start_time
-            ) node_count_by_period
-                ON nt.cluster_id = node_count_by_period.cluster_id
-                AND nt.start_time = node_count_by_period.start_time
-            WHERE we.cluster_id IS NOT NULL
-            GROUP BY we.job_id, we.job_run_id
-        ),
-        job_names AS (
-            SELECT DISTINCT
-                job_id,
-                name AS job_name
-            FROM system.lakeflow.jobs
-            WHERE delete_time IS NULL
-            QUALIFY ROW_NUMBER() OVER(PARTITION BY workspace_id, job_id ORDER BY change_time DESC) = 1
-        )
-        SELECT 
-            we.job_id,
-            COALESCE(jn.job_name, we.job_id) AS job_name,
-            we.job_run_id AS run_id,
-            we.start_time,
-            we.end_time,
-            we.duration_seconds,
-            COALESCE(we.status, 'UNKNOWN') AS status,
-            COALESCE(tm.task_count, 0) AS task_count,
-            COALESCE(tm.total_cpu_time, 0) AS total_cpu_time,
-            -- Memory GB-hours calculated from node metrics and duration
-            COALESCE(
-                (nm.avg_memory_utilization / 100.0) * 
-                (nm.max_nodes_used * 8.0) *  -- Assuming 8GB per node average, adjust as needed
-                (COALESCE(we.duration_seconds, 0) / 3600.0),
-                0
-            ) AS total_memory_gb_hours,
-            0.0 AS total_dbu_consumed,  -- DBU consumption can be calculated separately from billing tables
-            COALESCE(nm.avg_cpu_utilization, 0) AS avg_cpu_utilization,
-            COALESCE(nm.avg_memory_utilization, 0) AS avg_memory_utilization,
-            COALESCE(nm.max_nodes_used, 0) AS max_nodes_used,
-            COALESCE(nm.min_nodes_used, 0) AS min_nodes_used
-        FROM workflow_executions we
-        LEFT JOIN job_names jn ON we.job_id = jn.job_id
-        LEFT JOIN task_metrics tm 
-            ON we.job_id = tm.job_id AND we.job_run_id = tm.job_run_id
-        LEFT JOIN node_metrics nm 
-            ON we.job_id = nm.job_id AND we.job_run_id = nm.job_run_id
-        ORDER BY we.start_time DESC
-        """
-        
-        return query
-    
-    def _parse_workflow_metrics(self, row) -> WorkflowMetrics:
-        """Parse database row into WorkflowMetrics object"""
-        return WorkflowMetrics(
-            workflow_id=row[0],
-            workflow_name=row[1],
-            execution_id=row[2],
-            start_time=row[3],
-            end_time=row[4],
-            duration_seconds=row[5],
-            status=row[6],
-            task_count=row[7],
-            total_cpu_time=row[8],
-            total_memory_gb_hours=row[9],
-            total_dbu_consumed=row[10],
-            avg_cpu_utilization=row[11],
-            avg_memory_utilization=row[12],
-            max_nodes_used=row[13],
-            min_nodes_used=row[14]
-        )
-    
-    def get_workflow_list(self) -> List[Dict[str, str]]:
-        """
-        Get list of all workflows
-        
-        Returns:
-            List of dictionaries with workflow_id and workflow_name
-        """
-        query = """
-        SELECT DISTINCT 
-            job_id,
-            name AS job_name
-        FROM system.lakeflow.jobs
-        WHERE delete_time IS NULL
-        QUALIFY ROW_NUMBER() OVER(PARTITION BY workspace_id, job_id ORDER BY change_time DESC) = 1
-        ORDER BY job_name
-        """
-        
-        with sql.connect(**self.connection_params) as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(query)
-                results = cursor.fetchall()
-        
-        return [
-            {"workflow_id": row[0], "workflow_name": row[1]} 
-            for row in results
-        ]
-    
-    def get_resource_utilization(
-        self,
-        start_date: datetime,
-        end_date: datetime,
-        workspace_ids: Optional[List[str]] = None,
-        job_ids: Optional[List[str]] = None,
-        group_by_job: bool = True
-    ) -> List[ResourceUtilization]:
-        """
-        Get resource utilization metrics: provisioned vs actual usage
-        
-        Args:
-            start_date: Start date for analysis
-            end_date: End date for analysis
-            workspace_ids: Optional list of workspace IDs to filter
-            job_ids: Optional list of job IDs to filter
-            group_by_job: If True, group by job_id; if False, aggregate at workspace level
-            
-        Returns:
-            List of ResourceUtilization objects
-        """
-        query = self._build_resource_utilization_query(
-            start_date, end_date, workspace_ids, job_ids, group_by_job
-        )
-        
-        with sql.connect(**self.connection_params) as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(query)
-                results = cursor.fetchall()
-        
-        return [self._parse_resource_utilization(row, group_by_job) for row in results]
-    
-    def _build_resource_utilization_query(
-        self,
-        start_date: datetime,
-        end_date: datetime,
-        workspace_ids: Optional[List[str]],
-        job_ids: Optional[List[str]],
-        group_by_job: bool
-    ) -> str:
-        """Build SQL query for resource utilization analysis"""
-        
-        workspace_filter = ""
-        if workspace_ids:
-            workspace_ids_str = "', '".join(workspace_ids)
-            workspace_filter = f"AND workspace_id IN ('{workspace_ids_str}')"
-        
-        job_filter = ""
-        if job_ids:
-            job_ids_str = "', '".join(job_ids)
-            job_filter = f"AND job_id IN ('{job_ids_str}')"
-        
-        group_by_clause = "we.workspace_id, DATE(we.start_time)" if not group_by_job else "we.workspace_id, we.job_id, DATE(we.start_time)"
-        select_job_id = "NULL AS job_id" if not group_by_job else "we.job_id"
-        
-        query = f"""
-        WITH job_runs AS (
+                    workspace_id,
+                    job_id,
+                    job_run_id,
+                    compute_ids[0] AS cluster_id,
+                    period_start_time AS start_time,
+                    period_end_time AS end_time
+                FROM system.lakeflow.job_run_timeline
+                WHERE period_start_time >= '{start_date.isoformat()}'
+                    AND period_start_time < '{end_date.isoformat()}'
+                    AND size(compute_ids) > 0
+                    {workspace_filter}
+                    {job_filter}
+            ),
+            provisioned_resources AS (
+                SELECT DISTINCT
+                    c.cluster_id,
+                    c.workspace_id,
+                    COALESCE(c.worker_count, c.max_autoscale_workers, 1) AS worker_count,
+                    c.worker_node_type,
+                    c.driver_node_type,
+                    c.change_time
+                FROM system.compute.clusters c
+                INNER JOIN job_runs jr 
+                    ON c.cluster_id = jr.cluster_id
+                    AND c.workspace_id = jr.workspace_id
+                    AND c.change_time <= jr.start_time
+                QUALIFY ROW_NUMBER() OVER(
+                    PARTITION BY c.cluster_id, jr.job_run_id 
+                    ORDER BY c.change_time DESC
+                ) = 1
+            ),
+            node_specs AS (
+                SELECT 
+                    node_type,
+                    core_count,
+                    memory_mb / 1024.0 AS memory_gb
+                FROM system.compute.node_types
+            ),
+            cluster_provisioned AS (
+                SELECT 
+                    pr.cluster_id,
+                    pr.workspace_id,
+                    pr.worker_count,
+                    (COALESCE(driver_nt.core_count, 0) + COALESCE(worker_nt.core_count, 0) * pr.worker_count) AS total_cpus,
+                    (COALESCE(driver_nt.memory_gb, 0) + COALESCE(worker_nt.memory_gb, 0) * pr.worker_count) AS total_memory_gb,
+                    pr.worker_node_type
+                FROM provisioned_resources pr
+                LEFT JOIN node_specs driver_nt ON pr.driver_node_type = driver_nt.node_type
+                LEFT JOIN node_specs worker_nt ON pr.worker_node_type = worker_nt.node_type
+            ),
+            nodes_consumed_period AS (
+                SELECT 
+                    nt.cluster_id,
+                    nt.start_time,
+                    COUNT(DISTINCT nt.instance_id) AS nodes_consumed
+                FROM system.compute.node_timeline nt
+                INNER JOIN job_runs jr
+                    ON nt.cluster_id = jr.cluster_id
+                    AND nt.start_time >= jr.start_time
+                    AND (jr.end_time IS NULL OR nt.end_time <= jr.end_time)
+                GROUP BY nt.cluster_id, nt.start_time
+            ),
+            consumed_and_utilized AS (
+                SELECT 
+                    jr.workspace_id,
+                    jr.job_id,
+                    DATE(jr.start_time) AS usage_date,
+                    jr.cluster_id,
+                    AVG(cr.nodes_consumed) AS avg_nodes_consumed,
+                    AVG(cr.nodes_consumed * COALESCE(worker_nt.core_count, 4)) AS avg_cpus_consumed,
+                    AVG(cr.nodes_consumed * COALESCE(worker_nt.memory_gb, 16)) AS avg_memory_gb_consumed,
+                    AVG(nt.cpu_user_percent + nt.cpu_system_percent + nt.cpu_wait_percent) / 100.0 AS avg_cpu_utilization_pct,
+                    AVG(nt.mem_used_percent) / 100.0 AS avg_memory_utilization_pct
+                FROM system.compute.node_timeline nt
+                INNER JOIN job_runs jr
+                    ON nt.cluster_id = jr.cluster_id
+                    AND nt.start_time >= jr.start_time
+                    AND (jr.end_time IS NULL OR nt.end_time <= jr.end_time)
+                INNER JOIN nodes_consumed_period cr
+                    ON nt.cluster_id = cr.cluster_id
+                    AND nt.start_time = cr.start_time
+                INNER JOIN cluster_provisioned cp
+                    ON jr.cluster_id = cp.cluster_id
+                LEFT JOIN node_specs worker_nt
+                    ON cp.worker_node_type = worker_nt.node_type
+                GROUP BY jr.workspace_id, jr.job_id, DATE(jr.start_time), jr.cluster_id
+            ),
+            resource_comparison AS (
+                SELECT 
+                    cu.workspace_id,
+                    cu.job_id,
+                    cu.usage_date,
+                    cp.total_cpus AS cpus_provisioned,
+                    cp.total_memory_gb AS memory_gb_provisioned,
+                    cp.worker_count + 1 AS max_nodes_provisioned,
+                    cu.avg_cpus_consumed,
+                    cu.avg_memory_gb_consumed,
+                    cu.avg_nodes_consumed,
+                    cu.avg_cpus_consumed * cu.avg_cpu_utilization_pct AS cpus_utilized,
+                    cu.avg_memory_gb_consumed * cu.avg_memory_utilization_pct AS memory_gb_utilized
+                FROM consumed_and_utilized cu
+                INNER JOIN cluster_provisioned cp
+                    ON cu.cluster_id = cp.cluster_id
+                    AND cu.workspace_id = cp.workspace_id
+            )
             SELECT 
                 workspace_id,
                 job_id,
-                job_run_id,
-                -- Extract cluster_id from compute_ids array (first element)
-                compute_ids[0] AS cluster_id,
-                period_start_time AS start_time,
-                period_end_time AS end_time
-            FROM system.lakeflow.job_run_timeline
-            WHERE period_start_time >= '{start_date.isoformat()}'
-                AND period_start_time < '{end_date.isoformat()}'
-                AND size(compute_ids) > 0  -- Only include runs with compute
-                {workspace_filter}
-                {job_filter}
+                usage_date AS date,
+                SUM(cpus_provisioned) AS total_cpus_provisioned,
+                SUM(memory_gb_provisioned) AS total_memory_gb_provisioned,
+                MAX(max_nodes_provisioned) AS max_nodes_provisioned,
+                AVG(avg_cpus_consumed) AS avg_cpus_consumed,
+                AVG(avg_memory_gb_consumed) AS avg_memory_gb_consumed,
+                AVG(avg_nodes_consumed) AS avg_nodes_consumed,
+                AVG(cpus_utilized) AS avg_cpus_utilized,
+                AVG(memory_gb_utilized) AS avg_memory_gb_utilized,
+                CASE 
+                    WHEN SUM(cpus_provisioned) > 0 
+                    THEN (AVG(avg_cpus_consumed) / SUM(cpus_provisioned)) * 100.0 
+                    ELSE 0.0 
+                END AS provisioning_efficiency_pct,
+                CASE 
+                    WHEN AVG(avg_cpus_consumed) > 0 
+                    THEN (AVG(cpus_utilized) / AVG(avg_cpus_consumed)) * 100.0 
+                    ELSE 0.0 
+                END AS cpu_utilization_efficiency_pct,
+                CASE 
+                    WHEN AVG(avg_memory_gb_consumed) > 0 
+                    THEN (AVG(memory_gb_utilized) / AVG(avg_memory_gb_consumed)) * 100.0 
+                    ELSE 0.0 
+                END AS memory_utilization_efficiency_pct,
+                CASE 
+                    WHEN SUM(cpus_provisioned) > 0 
+                    THEN (AVG(cpus_utilized) / SUM(cpus_provisioned)) * 100.0 
+                    ELSE 0.0 
+                END AS cpu_utilization_pct,
+                CASE 
+                    WHEN SUM(memory_gb_provisioned) > 0 
+                    THEN (AVG(memory_gb_utilized) / SUM(memory_gb_provisioned)) * 100.0 
+                    ELSE 0.0 
+                END AS memory_utilization_pct
+            FROM resource_comparison
+            GROUP BY workspace_id, job_id, usage_date
         ),
-        -- Get provisioned resources from clusters table
-        -- Join with node_types to get CPU and memory per node
-        provisioned_resources AS (
-            SELECT DISTINCT
-                c.cluster_id,
-                c.workspace_id,
-                -- Get node counts (handle both fixed and autoscaling)
-                COALESCE(c.worker_count, c.max_autoscale_workers, 1) AS worker_count,
-                c.worker_node_type,
-                c.driver_node_type,
-                -- Get latest cluster config at time of job run
-                c.change_time
-            FROM system.compute.clusters c
-            INNER JOIN job_runs jr 
-                ON c.cluster_id = jr.cluster_id
-                AND c.workspace_id = jr.workspace_id
-                AND c.change_time <= jr.start_time
-            QUALIFY ROW_NUMBER() OVER(
-                PARTITION BY c.cluster_id, jr.job_run_id 
-                ORDER BY c.change_time DESC
-            ) = 1
-        ),
-        -- Get node type specifications (CPU cores and memory)
-        node_specs AS (
+        job_aggregates AS (
             SELECT 
-                node_type,
-                core_count,
-                memory_mb / 1024.0 AS memory_gb
-            FROM system.compute.node_types
+                workspace_id,
+                job_id,
+                AVG(provisioning_efficiency_pct) AS avg_provisioning_efficiency,
+                AVG(cpu_utilization_efficiency_pct) AS avg_cpu_utilization_efficiency,
+                AVG(memory_utilization_efficiency_pct) AS avg_memory_utilization_efficiency,
+                AVG(cpu_utilization_pct) AS avg_cpu_utilization,
+                AVG(memory_utilization_pct) AS avg_memory_utilization,
+                AVG(avg_nodes_consumed) AS avg_nodes_consumed,
+                AVG(avg_cpus_consumed) AS avg_cpus_consumed,
+                AVG(avg_memory_gb_consumed) AS avg_memory_gb_consumed,
+                MAX(max_nodes_provisioned) AS max_nodes_provisioned,
+                MAX(avg_nodes_consumed) AS max_nodes_consumed,
+                PERCENTILE_APPROX(avg_nodes_consumed, 0.95) AS p95_nodes_consumed,
+                COUNT(DISTINCT date) AS num_days_analyzed
+            FROM resource_utilization_base
+            WHERE job_id IS NOT NULL
+            GROUP BY workspace_id, job_id
         ),
-        -- Calculate provisioned resources per cluster
-        cluster_provisioned AS (
+        recommendations AS (
             SELECT 
-                pr.cluster_id,
-                pr.workspace_id,
-                pr.worker_count,
-                -- Driver: 1 node, Workers: worker_count nodes
-                (COALESCE(driver_nt.core_count, 0) + 
-                 COALESCE(worker_nt.core_count, 0) * pr.worker_count) AS total_cpus,
-                (COALESCE(driver_nt.memory_gb, 0) + 
-                 COALESCE(worker_nt.memory_gb, 0) * pr.worker_count) AS total_memory_gb
-            FROM provisioned_resources pr
-            LEFT JOIN node_specs driver_nt ON pr.driver_node_type = driver_nt.node_type
-            LEFT JOIN node_specs worker_nt ON pr.worker_node_type = worker_nt.node_type
-        ),
-        -- Calculate consumed resources per time period (nodes actually running)
-        nodes_consumed_period AS (
-            SELECT 
-                nt.cluster_id,
-                nt.start_time,
-                COUNT(DISTINCT nt.instance_id) AS nodes_consumed,
-                -- Get unique node types and their specs
-                COLLECT_SET(nt.node_type) AS node_types,
-                MAX(CASE WHEN nt.driver THEN 1 ELSE 0 END) AS has_driver
-            FROM system.compute.node_timeline nt
-            INNER JOIN job_runs jr
-                ON nt.cluster_id = jr.cluster_id
-                AND nt.start_time >= jr.start_time
-                AND (jr.end_time IS NULL OR nt.end_time <= jr.end_time)
-            GROUP BY nt.cluster_id, nt.start_time
-        ),
-        -- Calculate consumed CPUs/memory by joining with node specs
-        consumed_resources AS (
-            SELECT 
-                ncp.cluster_id,
-                ncp.start_time,
-                ncp.nodes_consumed,
-                -- Approximate consumed: use average node type specs
-                -- In practice, we'll use the worker node type from cluster config
-                ncp.nodes_consumed AS nodes_count
-            FROM nodes_consumed_period ncp
-        ),
-        -- Get utilization percentages and consumed resources
-        consumed_and_utilized AS (
-            SELECT 
-                jr.workspace_id,
-                jr.job_id,
-                DATE(jr.start_time) AS usage_date,
-                jr.cluster_id,
-                -- Consumed: actual nodes running (what was paid for)
-                AVG(cr.nodes_consumed) AS avg_nodes_consumed,
-                -- Calculate consumed CPUs/memory using worker node specs from cluster config
-                AVG(cr.nodes_consumed * COALESCE(worker_nt.core_count, 4)) AS avg_cpus_consumed,
-                AVG(cr.nodes_consumed * COALESCE(worker_nt.memory_gb, 16)) AS avg_memory_gb_consumed,
-                -- Utilized: actual usage percentage from node_timeline
-                AVG(nt.cpu_user_percent + nt.cpu_system_percent + nt.cpu_wait_percent) / 100.0 AS avg_cpu_utilization_pct,
-                AVG(nt.mem_used_percent) / 100.0 AS avg_memory_utilization_pct
-            FROM system.compute.node_timeline nt
-            INNER JOIN job_runs jr
-                ON nt.cluster_id = jr.cluster_id
-                AND nt.start_time >= jr.start_time
-                AND (jr.end_time IS NULL OR nt.end_time <= jr.end_time)
-            INNER JOIN consumed_resources cr
-                ON nt.cluster_id = cr.cluster_id
-                AND nt.start_time = cr.start_time
-            INNER JOIN cluster_provisioned cp
-                ON jr.cluster_id = cp.cluster_id
-            LEFT JOIN node_specs worker_nt
-                ON cp.worker_node_type = worker_nt.node_type
-            GROUP BY jr.workspace_id, jr.job_id, DATE(jr.start_time), jr.cluster_id
-        ),
-        -- Combine provisioned, consumed, and utilized
-        resource_comparison AS (
-            SELECT 
-                cu.workspace_id,
-                cu.job_id,
-                cu.usage_date,
-                -- Provisioned (configured maximum)
-                cp.total_cpus AS cpus_provisioned,
-                cp.total_memory_gb AS memory_gb_provisioned,
-                cp.worker_count + 1 AS max_nodes_provisioned,  -- workers + driver
-                -- Consumed (actually running/paid for)
-                cu.avg_cpus_consumed,
-                cu.avg_memory_gb_consumed,
-                cu.avg_nodes_consumed,
-                -- Utilized (actually used from consumed)
-                cu.avg_cpus_consumed * cu.avg_cpu_utilization_pct AS cpus_utilized,
-                cu.avg_memory_gb_consumed * cu.avg_memory_utilization_pct AS memory_gb_utilized
-            FROM consumed_and_utilized cu
-            INNER JOIN cluster_provisioned cp
-                ON cu.cluster_id = cp.cluster_id
-                AND cu.workspace_id = cp.workspace_id
+                ja.workspace_id,
+                ja.job_id,
+                '{current_node_type}' AS current_node_type,
+                CASE 
+                    WHEN '{current_node_type}' = 'Standard_E8s_v3' THEN
+                        CASE 
+                            WHEN ja.avg_cpu_utilization_efficiency < 50 
+                                 AND ja.avg_memory_utilization_efficiency < 50 
+                                 AND ja.avg_provisioning_efficiency < 50
+                                THEN 'Standard_E2s_v3'
+                            WHEN ja.avg_cpu_utilization_efficiency < 50 
+                                 AND ja.avg_memory_utilization_efficiency < 50
+                                THEN 'Standard_E4s_v3'
+                            WHEN ja.avg_cpu_utilization_efficiency < 50 
+                                 AND ja.avg_memory_utilization_efficiency >= 50 
+                                 AND ja.avg_memory_utilization_efficiency < 70
+                                THEN 'Standard_E4s_v3'
+                            WHEN ja.avg_memory_utilization_efficiency < 50 
+                                 AND ja.avg_cpu_utilization_efficiency >= 50
+                                THEN 'Standard_D8s_v3'
+                            WHEN ja.avg_memory_utilization_efficiency > 70 
+                                 AND ja.avg_cpu_utilization_efficiency < 50
+                                THEN 'Standard_E4s_v3'
+                            WHEN ja.avg_provisioning_efficiency < 50
+                                THEN 'Standard_E4s_v3'
+                            ELSE '{current_node_type}'
+                        END
+                    WHEN ja.avg_cpu_utilization_efficiency < 50 
+                         AND ja.avg_memory_utilization_efficiency < 50
+                        THEN 'Standard_E4s_v3'
+                    WHEN ja.avg_cpu_utilization_efficiency < 50
+                        THEN 'Standard_E4s_v3'
+                    WHEN ja.avg_memory_utilization_efficiency < 50
+                        THEN 'Standard_D8s_v3'
+                    ELSE '{current_node_type}'
+                END AS recommended_node_type,
+                1 AS current_min_workers,
+                ja.max_nodes_provisioned AS current_max_workers,
+                GREATEST(1, CEIL(ja.avg_nodes_consumed * (1 - {safety_margin}))) AS recommended_min_workers,
+                CASE 
+                    WHEN CEIL(ja.p95_nodes_consumed * (1 + {safety_margin})) > ja.max_nodes_provisioned 
+                         AND ja.avg_provisioning_efficiency > 70
+                    THEN ja.max_nodes_provisioned
+                    ELSE GREATEST(
+                        GREATEST(1, CEIL(ja.avg_nodes_consumed * (1 - {safety_margin}))),
+                        CEIL(ja.p95_nodes_consumed * (1 + {safety_margin}))
+                    )
+                END AS recommended_max_workers,
+                LEAST(100, ja.avg_cpu_utilization_efficiency * 1.2) AS expected_cpu_utilization_pct,
+                LEAST(100, ja.avg_memory_utilization_efficiency * 1.1) AS expected_memory_utilization_pct,
+                0.0 AS expected_cost_reduction_pct,
+                CONCAT(
+                    CASE 
+                        WHEN ja.avg_cpu_utilization_efficiency < 50 
+                             OR ja.avg_memory_utilization_efficiency < 50 
+                             OR ja.avg_provisioning_efficiency < 50
+                        THEN 'Recommendation: Adjust node type and worker count based on utilization patterns. '
+                        ELSE 'Current configuration appears adequate. '
+                    END,
+                    'CPU efficiency: ', ROUND(ja.avg_cpu_utilization_efficiency, 1), '%. ',
+                    'Memory efficiency: ', ROUND(ja.avg_memory_utilization_efficiency, 1), '%. ',
+                    'Provisioning efficiency: ', ROUND(ja.avg_provisioning_efficiency, 1), '%.'
+                ) AS rationale,
+                LEAST(1.0, GREATEST(0.0,
+                    (CASE WHEN ja.avg_cpu_utilization_efficiency < 50 THEN 0.7 ELSE 0.5 END +
+                     CASE WHEN ja.avg_memory_utilization_efficiency < 50 THEN 0.7 ELSE 0.5 END +
+                     CASE WHEN ja.avg_provisioning_efficiency < 50 THEN 0.7 ELSE 0.5 END) / 3.0 * 0.7 +
+                    LEAST(ja.num_days_analyzed / 10.0, 1.0) * 0.3
+                )) AS confidence_score,
+                ja.avg_provisioning_efficiency,
+                ja.avg_cpu_utilization_efficiency,
+                ja.avg_memory_utilization_efficiency,
+                ja.avg_nodes_consumed,
+                ja.p95_nodes_consumed,
+                ja.max_nodes_consumed
+            FROM job_aggregates ja
         )
-        SELECT 
-            workspace_id,
-            {select_job_id},
-            usage_date AS date,
-            -- Provisioned (configured maximum)
-            SUM(cpus_provisioned) AS total_cpus_provisioned,
-            SUM(memory_gb_provisioned) AS total_memory_gb_provisioned,
-            MAX(max_nodes_provisioned) AS max_nodes_provisioned,
-            -- Consumed (actually running/paid for)
-            AVG(avg_cpus_consumed) AS avg_cpus_consumed,
-            AVG(avg_memory_gb_consumed) AS avg_memory_gb_consumed,
-            AVG(avg_nodes_consumed) AS avg_nodes_consumed,
-            -- Utilized (actually used from consumed)
-            AVG(cpus_utilized) AS avg_cpus_utilized,
-            AVG(memory_gb_utilized) AS avg_memory_gb_utilized,
-            -- Efficiency metrics
-            -- Provisioning efficiency: (consumed / provisioned) * 100
-            CASE 
-                WHEN SUM(cpus_provisioned) > 0 
-                THEN (AVG(avg_cpus_consumed) / SUM(cpus_provisioned)) * 100.0 
-                ELSE 0.0 
-            END AS provisioning_efficiency_pct,
-            -- Utilization efficiency: (utilized / consumed) * 100
-            CASE 
-                WHEN AVG(avg_cpus_consumed) > 0 
-                THEN (AVG(cpus_utilized) / AVG(avg_cpus_consumed)) * 100.0 
-                ELSE 0.0 
-            END AS cpu_utilization_efficiency_pct,
-            CASE 
-                WHEN AVG(avg_memory_gb_consumed) > 0 
-                THEN (AVG(memory_gb_utilized) / AVG(avg_memory_gb_consumed)) * 100.0 
-                ELSE 0.0 
-            END AS memory_utilization_efficiency_pct,
-            -- Legacy metrics: (utilized / provisioned) * 100
-            CASE 
-                WHEN SUM(cpus_provisioned) > 0 
-                THEN (AVG(cpus_utilized) / SUM(cpus_provisioned)) * 100.0 
-                ELSE 0.0 
-            END AS cpu_utilization_pct,
-            CASE 
-                WHEN SUM(memory_gb_provisioned) > 0 
-                THEN (AVG(memory_gb_utilized) / SUM(memory_gb_provisioned)) * 100.0 
-                ELSE 0.0 
-            END AS memory_utilization_pct
-        FROM resource_comparison
-        GROUP BY {group_by_clause}
-        ORDER BY workspace_id{", job_id" if group_by_job else ""}, date
+        SELECT * FROM recommendations
+        ORDER BY workspace_id, job_id
         """
-        
-        return query
-    
-    def _parse_resource_utilization(self, row, group_by_job: bool) -> ResourceUtilization:
-        """Parse database row into ResourceUtilization object"""
-        idx = 0
-        workspace_id = row[idx]
-        idx += 1
-        
-        job_id = None
-        if group_by_job:
-            job_id = row[idx]
-            idx += 1
-        
-        date = str(row[idx])  # Date as string
-        idx += 1
-        
-        # Parse row based on new structure:
-        # provisioned (3), consumed (3), utilized (2), efficiencies (3), legacy (2)
-        return ResourceUtilization(
-            workspace_id=workspace_id,
-            job_id=job_id,
-            date=date,
-            # Provisioned
-            total_cpus_provisioned=float(row[idx]) if row[idx] else 0.0,
-            total_memory_gb_provisioned=float(row[idx + 1]) if row[idx + 1] else 0.0,
-            max_nodes_provisioned=int(row[idx + 2]) if row[idx + 2] else 0,
-            # Consumed
-            avg_cpus_consumed=float(row[idx + 3]) if row[idx + 3] else 0.0,
-            avg_memory_gb_consumed=float(row[idx + 4]) if row[idx + 4] else 0.0,
-            avg_nodes_consumed=float(row[idx + 5]) if row[idx + 5] else 0.0,
-            # Utilized
-            avg_cpus_utilized=float(row[idx + 6]) if row[idx + 6] else 0.0,
-            avg_memory_gb_utilized=float(row[idx + 7]) if row[idx + 7] else 0.0,
-            # Efficiency metrics
-            provisioning_efficiency_pct=float(row[idx + 8]) if row[idx + 8] else 0.0,
-            cpu_utilization_efficiency_pct=float(row[idx + 9]) if row[idx + 9] else 0.0,
-            memory_utilization_efficiency_pct=float(row[idx + 10]) if row[idx + 10] else 0.0,
-            # Legacy metrics (utilized / provisioned)
-            cpu_utilization_pct=float(row[idx + 11]) if row[idx + 11] else 0.0,
-            memory_utilization_pct=float(row[idx + 12]) if row[idx + 12] else 0.0
-        )
