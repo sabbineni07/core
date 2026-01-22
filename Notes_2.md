@@ -1,4 +1,3 @@
--- Time-Based Task Cost Allocation (Handles Parallel Tasks)
 WITH job_task_runs AS (
     SELECT 
         tr.workspace_id,
