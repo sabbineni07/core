@@ -1,251 +1,47 @@
-query = f"""
-        WITH resource_utilization_base AS (
-            WITH job_runs AS (
-                SELECT 
-                    workspace_id,
-                    job_id,
-                    job_run_id,
-                    compute_ids[0] AS cluster_id,
-                    period_start_time AS start_time,
-                    period_end_time AS end_time
-                FROM system.lakeflow.job_run_timeline
-                WHERE period_start_time >= '{start_date.isoformat()}'
-                    AND period_start_time < '{end_date.isoformat()}'
-                    AND size(compute_ids) > 0
-                    {workspace_filter}
-                    {job_filter}
-            ),
-            provisioned_resources AS (
-                SELECT DISTINCT
-                    c.cluster_id,
-                    c.workspace_id,
-                    COALESCE(c.worker_count, c.max_autoscale_workers, 1) AS worker_count,
-                    c.worker_node_type,
-                    c.driver_node_type,
-                    c.change_time
-                FROM system.compute.clusters c
-                INNER JOIN job_runs jr 
-                    ON c.cluster_id = jr.cluster_id
-                    AND c.workspace_id = jr.workspace_id
-                    AND c.change_time <= jr.start_time
-                QUALIFY ROW_NUMBER() OVER(
-                    PARTITION BY c.cluster_id, jr.job_run_id 
-                    ORDER BY c.change_time DESC
-                ) = 1
-            ),
-            node_specs AS (
-                SELECT 
-                    node_type,
-                    core_count,
-                    memory_mb / 1024.0 AS memory_gb
-                FROM system.compute.node_types
-            ),
-            cluster_provisioned AS (
-                SELECT 
-                    pr.cluster_id,
-                    pr.workspace_id,
-                    pr.worker_count,
-                    (COALESCE(driver_nt.core_count, 0) + COALESCE(worker_nt.core_count, 0) * pr.worker_count) AS total_cpus,
-                    (COALESCE(driver_nt.memory_gb, 0) + COALESCE(worker_nt.memory_gb, 0) * pr.worker_count) AS total_memory_gb,
-                    pr.worker_node_type
-                FROM provisioned_resources pr
-                LEFT JOIN node_specs driver_nt ON pr.driver_node_type = driver_nt.node_type
-                LEFT JOIN node_specs worker_nt ON pr.worker_node_type = worker_nt.node_type
-            ),
-            nodes_consumed_period AS (
-                SELECT 
-                    nt.cluster_id,
-                    nt.start_time,
-                    COUNT(DISTINCT nt.instance_id) AS nodes_consumed
-                FROM system.compute.node_timeline nt
-                INNER JOIN job_runs jr
-                    ON nt.cluster_id = jr.cluster_id
-                    AND nt.start_time >= jr.start_time
-                    AND (jr.end_time IS NULL OR nt.end_time <= jr.end_time)
-                GROUP BY nt.cluster_id, nt.start_time
-            ),
-            consumed_and_utilized AS (
-                SELECT 
-                    jr.workspace_id,
-                    jr.job_id,
-                    DATE(jr.start_time) AS usage_date,
-                    jr.cluster_id,
-                    AVG(cr.nodes_consumed) AS avg_nodes_consumed,
-                    AVG(cr.nodes_consumed * COALESCE(worker_nt.core_count, 4)) AS avg_cpus_consumed,
-                    AVG(cr.nodes_consumed * COALESCE(worker_nt.memory_gb, 16)) AS avg_memory_gb_consumed,
-                    AVG(nt.cpu_user_percent + nt.cpu_system_percent + nt.cpu_wait_percent) / 100.0 AS avg_cpu_utilization_pct,
-                    AVG(nt.mem_used_percent) / 100.0 AS avg_memory_utilization_pct
-                FROM system.compute.node_timeline nt
-                INNER JOIN job_runs jr
-                    ON nt.cluster_id = jr.cluster_id
-                    AND nt.start_time >= jr.start_time
-                    AND (jr.end_time IS NULL OR nt.end_time <= jr.end_time)
-                INNER JOIN nodes_consumed_period cr
-                    ON nt.cluster_id = cr.cluster_id
-                    AND nt.start_time = cr.start_time
-                INNER JOIN cluster_provisioned cp
-                    ON jr.cluster_id = cp.cluster_id
-                LEFT JOIN node_specs worker_nt
-                    ON cp.worker_node_type = worker_nt.node_type
-                GROUP BY jr.workspace_id, jr.job_id, DATE(jr.start_time), jr.cluster_id
-            ),
-            resource_comparison AS (
-                SELECT 
-                    cu.workspace_id,
-                    cu.job_id,
-                    cu.usage_date,
-                    cp.total_cpus AS cpus_provisioned,
-                    cp.total_memory_gb AS memory_gb_provisioned,
-                    cp.worker_count + 1 AS max_nodes_provisioned,
-                    cu.avg_cpus_consumed,
-                    cu.avg_memory_gb_consumed,
-                    cu.avg_nodes_consumed,
-                    cu.avg_cpus_consumed * cu.avg_cpu_utilization_pct AS cpus_utilized,
-                    cu.avg_memory_gb_consumed * cu.avg_memory_utilization_pct AS memory_gb_utilized
-                FROM consumed_and_utilized cu
-                INNER JOIN cluster_provisioned cp
-                    ON cu.cluster_id = cp.cluster_id
-                    AND cu.workspace_id = cp.workspace_id
-            )
-            SELECT 
-                workspace_id,
-                job_id,
-                usage_date AS date,
-                SUM(cpus_provisioned) AS total_cpus_provisioned,
-                SUM(memory_gb_provisioned) AS total_memory_gb_provisioned,
-                MAX(max_nodes_provisioned) AS max_nodes_provisioned,
-                AVG(avg_cpus_consumed) AS avg_cpus_consumed,
-                AVG(avg_memory_gb_consumed) AS avg_memory_gb_consumed,
-                AVG(avg_nodes_consumed) AS avg_nodes_consumed,
-                AVG(cpus_utilized) AS avg_cpus_utilized,
-                AVG(memory_gb_utilized) AS avg_memory_gb_utilized,
-                CASE 
-                    WHEN SUM(cpus_provisioned) > 0 
-                    THEN (AVG(avg_cpus_consumed) / SUM(cpus_provisioned)) * 100.0 
-                    ELSE 0.0 
-                END AS provisioning_efficiency_pct,
-                CASE 
-                    WHEN AVG(avg_cpus_consumed) > 0 
-                    THEN (AVG(cpus_utilized) / AVG(avg_cpus_consumed)) * 100.0 
-                    ELSE 0.0 
-                END AS cpu_utilization_efficiency_pct,
-                CASE 
-                    WHEN AVG(avg_memory_gb_consumed) > 0 
-                    THEN (AVG(memory_gb_utilized) / AVG(avg_memory_gb_consumed)) * 100.0 
-                    ELSE 0.0 
-                END AS memory_utilization_efficiency_pct,
-                CASE 
-                    WHEN SUM(cpus_provisioned) > 0 
-                    THEN (AVG(cpus_utilized) / SUM(cpus_provisioned)) * 100.0 
-                    ELSE 0.0 
-                END AS cpu_utilization_pct,
-                CASE 
-                    WHEN SUM(memory_gb_provisioned) > 0 
-                    THEN (AVG(memory_gb_utilized) / SUM(memory_gb_provisioned)) * 100.0 
-                    ELSE 0.0 
-                END AS memory_utilization_pct
-            FROM resource_comparison
-            GROUP BY workspace_id, job_id, usage_date
-        ),
-        job_aggregates AS (
-            SELECT 
-                workspace_id,
-                job_id,
-                AVG(provisioning_efficiency_pct) AS avg_provisioning_efficiency,
-                AVG(cpu_utilization_efficiency_pct) AS avg_cpu_utilization_efficiency,
-                AVG(memory_utilization_efficiency_pct) AS avg_memory_utilization_efficiency,
-                AVG(cpu_utilization_pct) AS avg_cpu_utilization,
-                AVG(memory_utilization_pct) AS avg_memory_utilization,
-                AVG(avg_nodes_consumed) AS avg_nodes_consumed,
-                AVG(avg_cpus_consumed) AS avg_cpus_consumed,
-                AVG(avg_memory_gb_consumed) AS avg_memory_gb_consumed,
-                MAX(max_nodes_provisioned) AS max_nodes_provisioned,
-                MAX(avg_nodes_consumed) AS max_nodes_consumed,
-                PERCENTILE_APPROX(avg_nodes_consumed, 0.95) AS p95_nodes_consumed,
-                COUNT(DISTINCT date) AS num_days_analyzed
-            FROM resource_utilization_base
-            WHERE job_id IS NOT NULL
-            GROUP BY workspace_id, job_id
-        ),
-        recommendations AS (
-            SELECT 
-                ja.workspace_id,
-                ja.job_id,
-                '{current_node_type}' AS current_node_type,
-                CASE 
-                    WHEN '{current_node_type}' = 'Standard_E8s_v3' THEN
-                        CASE 
-                            WHEN ja.avg_cpu_utilization_efficiency < 50 
-                                 AND ja.avg_memory_utilization_efficiency < 50 
-                                 AND ja.avg_provisioning_efficiency < 50
-                                THEN 'Standard_E2s_v3'
-                            WHEN ja.avg_cpu_utilization_efficiency < 50 
-                                 AND ja.avg_memory_utilization_efficiency < 50
-                                THEN 'Standard_E4s_v3'
-                            WHEN ja.avg_cpu_utilization_efficiency < 50 
-                                 AND ja.avg_memory_utilization_efficiency >= 50 
-                                 AND ja.avg_memory_utilization_efficiency < 70
-                                THEN 'Standard_E4s_v3'
-                            WHEN ja.avg_memory_utilization_efficiency < 50 
-                                 AND ja.avg_cpu_utilization_efficiency >= 50
-                                THEN 'Standard_D8s_v3'
-                            WHEN ja.avg_memory_utilization_efficiency > 70 
-                                 AND ja.avg_cpu_utilization_efficiency < 50
-                                THEN 'Standard_E4s_v3'
-                            WHEN ja.avg_provisioning_efficiency < 50
-                                THEN 'Standard_E4s_v3'
-                            ELSE '{current_node_type}'
-                        END
-                    WHEN ja.avg_cpu_utilization_efficiency < 50 
-                         AND ja.avg_memory_utilization_efficiency < 50
-                        THEN 'Standard_E4s_v3'
-                    WHEN ja.avg_cpu_utilization_efficiency < 50
-                        THEN 'Standard_E4s_v3'
-                    WHEN ja.avg_memory_utilization_efficiency < 50
-                        THEN 'Standard_D8s_v3'
-                    ELSE '{current_node_type}'
-                END AS recommended_node_type,
-                1 AS current_min_workers,
-                ja.max_nodes_provisioned AS current_max_workers,
-                GREATEST(1, CEIL(ja.avg_nodes_consumed * (1 - {safety_margin}))) AS recommended_min_workers,
-                CASE 
-                    WHEN CEIL(ja.p95_nodes_consumed * (1 + {safety_margin})) > ja.max_nodes_provisioned 
-                         AND ja.avg_provisioning_efficiency > 70
-                    THEN ja.max_nodes_provisioned
-                    ELSE GREATEST(
-                        GREATEST(1, CEIL(ja.avg_nodes_consumed * (1 - {safety_margin}))),
-                        CEIL(ja.p95_nodes_consumed * (1 + {safety_margin}))
-                    )
-                END AS recommended_max_workers,
-                LEAST(100, ja.avg_cpu_utilization_efficiency * 1.2) AS expected_cpu_utilization_pct,
-                LEAST(100, ja.avg_memory_utilization_efficiency * 1.1) AS expected_memory_utilization_pct,
-                0.0 AS expected_cost_reduction_pct,
-                CONCAT(
-                    CASE 
-                        WHEN ja.avg_cpu_utilization_efficiency < 50 
-                             OR ja.avg_memory_utilization_efficiency < 50 
-                             OR ja.avg_provisioning_efficiency < 50
-                        THEN 'Recommendation: Adjust node type and worker count based on utilization patterns. '
-                        ELSE 'Current configuration appears adequate. '
-                    END,
-                    'CPU efficiency: ', ROUND(ja.avg_cpu_utilization_efficiency, 1), '%. ',
-                    'Memory efficiency: ', ROUND(ja.avg_memory_utilization_efficiency, 1), '%. ',
-                    'Provisioning efficiency: ', ROUND(ja.avg_provisioning_efficiency, 1), '%.'
-                ) AS rationale,
-                LEAST(1.0, GREATEST(0.0,
-                    (CASE WHEN ja.avg_cpu_utilization_efficiency < 50 THEN 0.7 ELSE 0.5 END +
-                     CASE WHEN ja.avg_memory_utilization_efficiency < 50 THEN 0.7 ELSE 0.5 END +
-                     CASE WHEN ja.avg_provisioning_efficiency < 50 THEN 0.7 ELSE 0.5 END) / 3.0 * 0.7 +
-                    LEAST(ja.num_days_analyzed / 10.0, 1.0) * 0.3
-                )) AS confidence_score,
-                ja.avg_provisioning_efficiency,
-                ja.avg_cpu_utilization_efficiency,
-                ja.avg_memory_utilization_efficiency,
-                ja.avg_nodes_consumed,
-                ja.p95_nodes_consumed,
-                ja.max_nodes_consumed
-            FROM job_aggregates ja
-        )
-        SELECT * FROM recommendations
-        ORDER BY workspace_id, job_id
-        """
+Technical Design: DLT Deduplication & Historical Backfill
+1. Problem Statement
+The current DLT Streaming Table (using APPEND FLOW) contains duplicates. Due to a 30-day source retention limit and multi-year target history, a standard DLT "Full Refresh" is impossible without causing massive data loss. Standard APPLY CHANGES logic is excluded due to performance overhead at high volumes.
+
+2. Proposed Solution: The "Hybrid Seed" Refresh
+We will perform a managed migration that "seeds" a clean target table with historical data while simultaneously attaching a filtered stream to capture new data.
+
+3. Execution Steps
+Phase	Action	Purpose
+I: Preparation	Stop the DLT pipeline and create a deduplicated backup of the target table (target_backup).	Ensures a "Golden Record" exists and prevents concurrent writes.
+II: Code Change	Implement two append_flow functions: one static (spark.read) for the backup and one streaming (dlt.read_stream) with a date filter.	Allows DLT to re-build the table metadata from scratch using both history and current stream.
+III: Re-Base	Trigger a Full Refresh in the DLT UI.	Clears the corrupted table and populates it with deduplicated history + recent 30-day data.
+IV: Finalization	Remove the backup flow and the date filter; execute a Standard Start.	Returns the pipeline to a clean, high-performance "append-only" state.
+
+Export to Sheets
+
+4. Implementation Code (Step III Phase)
+Python
+
+import dlt
+from pyspark.sql.functions import col
+
+# Flow A: Historical Backfill (Runs once during Full Refresh)
+@dlt.append_flow(target="target_table")
+def seed_history():
+    return spark.read.table("main.schema.target_backup")
+
+# Flow B: Incremental Stream (Captures live data post-backup)
+@dlt.append_flow(target="target_table")
+def filtered_stream():
+    return (
+        dlt.read_stream("source_bronze")
+           .filter(col("source_timestamp") > "2026-01-01 00:00:00") # Backup Max TS
+    )
+5. Why this is the "Best" Option
+Zero Data Loss: By seeding history via a static read during the refresh, we bypass the 30-day retention limit of the source.
+
+High Performance: We avoid the state-store overhead and compute cost of APPLY CHANGES (SCD Type 1), maintaining the speed of a standard APPEND.
+
+Checkpoint Integrity: A "Full Refresh" creates a clean checkpoint. By the time we remove the filter in Step IV, the stream is already past the "duplicate zone."
+
+Metadata Safety: It follows the native DLT lifecycle, ensuring the table remains fully managed and compatible with Unity Catalog.
+
+6. Critical Engineering Guardrails
+⚠️ Warning: Step IV MUST be a Standard Start. If a Full Refresh is triggered after removing the backup code, the historical data (pre-30 days) will be deleted.
+
+⚠️ Filter Precision: The timestamp filter in filtered_stream must align exactly with the MAX(timestamp) in the backup table to prevent gaps or double-counting at the cutover point.
