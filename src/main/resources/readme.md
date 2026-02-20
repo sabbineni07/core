@@ -1124,3 +1124,322 @@ WHERE
         REGEXP_EXTRACT(Tags, '"JobId"\\s*:\\s*"([^"]+)"', 1) IS NULL
         OR REGEXP_EXTRACT(Tags, '"ClusterId"\\s*:\\s*"([^"]+)"', 1) IS NULL
     );
+
+
+-- ============================================================================
+-- QUERY 7: Flat Cost Data - DBU + ACM Costs Combined (For Analysis)
+-- ============================================================================
+-- This query provides a flat structure with DBU costs from system tables
+-- and all other costs from ACM, allowing end users to aggregate and analyze
+-- Each row represents one cost line item per job run
+
+WITH
+-- Parse Azure Cost Data
+parsed_azure_costs AS (
+    SELECT
+        SubscriptionGuid,
+        ResourceGroup,
+        ResourceLocation,
+        UsageDateTime,
+        MeterCategory,
+        MeterSubCategory,
+        MeterId,
+        MeterName,
+        MeterRegion,
+        UsageQuantity,
+        ResourceRate,
+        PreTaxCost,
+        ConsumedService,
+        ResourceType,
+        InstanceId,
+        OfferId,
+        AdditionalInfo,
+        ServiceInfo1,
+        ServiceInfo2,
+        ServiceName,
+        ServiceTier,
+        Currency,
+        UnitOfMeasure,
+        REGEXP_EXTRACT(Tags, '"JobId"\\s*:\\s*"([^"]+)"', 1) AS JobId,
+        REGEXP_EXTRACT(Tags, '"ClusterId"\\s*:\\s*"([^"]+)"', 1) AS ClusterId,
+        REGEXP_EXTRACT(Tags, '"RunName"\\s*:\\s*"([^"]+)"', 1) AS RunName,
+        REGEXP_EXTRACT(Tags, '"Team"\\s*:\\s*"([^"]+)"', 1) AS Team,
+        REGEXP_EXTRACT(Tags, '"JobType"\\s*:\\s*"([^"]+)"', 1) AS JobType,
+        REGEXP_EXTRACT(Tags, '"Environment"\\s*:\\s*"([^"]+)"', 1) AS Environment,
+        REGEXP_EXTRACT(Tags, '"ClusterName"\\s*:\\s*"([^"]+)"', 1) AS ClusterName,
+        REGEXP_EXTRACT(Tags, '"DatabricksWorkspace"\\s*:\\s*"([^"]+)"', 1) AS DatabricksWorkspace,
+        REGEXP_EXTRACT(Tags, '"ResourceClass"\\s*:\\s*"([^"]+)"', 1) AS ResourceClass,
+        DATE(UsageDateTime) AS UsageDate,
+        Tags AS OriginalTags
+    FROM
+        azure_cost_usage_data
+    WHERE
+        DATE(UsageDateTime) = DATE_SUB(CURRENT_DATE(), 1)
+        AND MeterCategory IN (
+            'Azure Databricks',
+            'Virtual Machines',
+            'Storage',
+            'Bandwidth',
+            'Virtual Network',
+            'Microsoft Defender for Cloud'
+        )
+        AND REGEXP_EXTRACT(Tags, '"JobId"\\s*:\\s*"([^"]+)"', 1) IS NOT NULL
+        AND REGEXP_EXTRACT(Tags, '"ClusterId"\\s*:\\s*"([^"]+)"', 1) IS NOT NULL
+),
+
+-- Get Job Run Details
+job_run_details AS (
+    SELECT
+        jrt.account_id,
+        jrt.workspace_id,
+        jrt.job_id,
+        jrt.job_run_id,
+        jrt.cluster_id,
+        jrt.name AS job_name,
+        jrt.run_name,
+        jrt.start_time,
+        jrt.end_time,
+        jrt.duration_seconds,
+        jrt.result_state,
+        jrt.termination_code,
+        jrt.trigger_type,
+        jrt.run_type,
+        jrt.creator_user_name,
+        jrt.run_as_user_name,
+        DATE(jrt.start_time) AS run_date,
+        COALESCE(
+            (UNIX_TIMESTAMP(jrt.end_time) - UNIX_TIMESTAMP(jrt.start_time)) / 3600.0,
+            0
+        ) AS duration_hours
+    FROM
+        system.lakeflow.job_run_timeline jrt
+    WHERE
+        DATE(jrt.start_time) = DATE_SUB(CURRENT_DATE(), 1)
+        AND jrt.result_state IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT')
+        AND jrt.cluster_id IS NOT NULL
+),
+
+-- Get DBU Usage from System Billing Table
+job_run_dbu_usage AS (
+    SELECT
+        bu.account_id,
+        bu.workspace_id,
+        bu.job_id,
+        bu.job_run_id,
+        bu.cluster_id,
+        DATE(bu.usage_start_time) AS usage_date,
+        SUM(bu.usage_quantity) AS total_dbu_consumed,
+        SUM(bu.cost_in_billing_currency) AS total_dbu_cost
+    FROM
+        system.billing.usage bu
+    WHERE
+        DATE(bu.usage_start_time) = DATE_SUB(CURRENT_DATE(), 1)
+        AND bu.job_id IS NOT NULL
+        AND bu.job_run_id IS NOT NULL
+    GROUP BY
+        bu.account_id,
+        bu.workspace_id,
+        bu.job_id,
+        bu.job_run_id,
+        bu.cluster_id,
+        DATE(bu.usage_start_time)
+),
+
+-- ACM Costs (non-DBU costs from Azure)
+acm_costs AS (
+    SELECT
+        -- Job Run Identifiers
+        jrd.job_run_id,
+        jrd.job_id,
+        jrd.cluster_id,
+        jrd.job_name,
+        jrd.run_name,
+        
+        -- Job Run Metadata
+        jrd.start_time AS job_start_time,
+        jrd.end_time AS job_end_time,
+        jrd.duration_seconds,
+        jrd.duration_hours,
+        jrd.result_state,
+        jrd.termination_code,
+        jrd.trigger_type,
+        jrd.run_type,
+        jrd.creator_user_name,
+        jrd.run_as_user_name,
+        jrd.account_id,
+        jrd.workspace_id,
+        jrd.run_date,
+        
+        -- Organizational Tags
+        pac.Team,
+        pac.JobType,
+        pac.Environment,
+        pac.ClusterName,
+        pac.DatabricksWorkspace,
+        pac.ResourceClass,
+        
+        -- Azure Metadata
+        pac.SubscriptionGuid,
+        pac.ResourceGroup,
+        pac.ResourceLocation,
+        pac.InstanceId,
+        
+        -- Cost Information
+        pac.MeterCategory AS cost_category,
+        pac.MeterSubCategory AS cost_subcategory,
+        pac.MeterName AS cost_meter_name,
+        pac.MeterId AS cost_meter_id,
+        pac.PreTaxCost AS cost_amount,
+        pac.UsageQuantity AS usage_quantity,
+        pac.UnitOfMeasure AS unit_of_measure,
+        pac.ResourceRate AS unit_rate,
+        pac.Currency AS currency,
+        pac.UsageDateTime AS cost_date,
+        
+        -- Source indicator
+        'ACM' AS cost_source
+        
+    FROM
+        parsed_azure_costs pac
+    INNER JOIN
+        job_run_details jrd
+        ON pac.JobId = jrd.job_id
+        AND pac.ClusterId = jrd.cluster_id
+        AND DATE(pac.UsageDateTime) = DATE(jrd.start_time)
+    WHERE
+        -- Exclude Azure Databricks costs (we'll get DBU costs from system tables)
+        pac.MeterCategory != 'Azure Databricks'
+),
+
+-- DBU Costs from System Tables
+dbu_costs AS (
+    SELECT
+        -- Job Run Identifiers
+        jrd.job_run_id,
+        jrd.job_id,
+        jrd.cluster_id,
+        jrd.job_name,
+        jrd.run_name,
+        
+        -- Job Run Metadata
+        jrd.start_time AS job_start_time,
+        jrd.end_time AS job_end_time,
+        jrd.duration_seconds,
+        jrd.duration_hours,
+        jrd.result_state,
+        jrd.termination_code,
+        jrd.trigger_type,
+        jrd.run_type,
+        jrd.creator_user_name,
+        jrd.run_as_user_name,
+        jrd.account_id,
+        jrd.workspace_id,
+        jrd.run_date,
+        
+        -- Organizational Tags (from job run, may need to join with jobs table for tags)
+        NULL AS Team,  -- Can be enriched from system.lakeflow.jobs if needed
+        NULL AS JobType,
+        NULL AS Environment,
+        NULL AS ClusterName,
+        NULL AS DatabricksWorkspace,
+        NULL AS ResourceClass,
+        
+        -- Azure Metadata (not available in system tables)
+        NULL AS SubscriptionGuid,
+        NULL AS ResourceGroup,
+        NULL AS ResourceLocation,
+        NULL AS InstanceId,
+        
+        -- Cost Information
+        'Azure Databricks' AS cost_category,
+        'DBU Usage' AS cost_subcategory,
+        'Databricks Units' AS cost_meter_name,
+        'DBU' AS cost_meter_id,
+        dbu.total_dbu_cost AS cost_amount,
+        dbu.total_dbu_consumed AS usage_quantity,
+        'DBU' AS unit_of_measure,
+        NULL AS unit_rate,  -- Rate not available in system.billing.usage
+        'USD' AS currency,  -- Default, may vary
+        dbu.usage_date AS cost_date,
+        
+        -- Source indicator
+        'System Tables' AS cost_source
+        
+    FROM
+        job_run_dbu_usage dbu
+    INNER JOIN
+        job_run_details jrd
+        ON dbu.job_run_id = jrd.job_run_id
+        AND dbu.job_id = jrd.job_id
+        AND dbu.cluster_id = jrd.cluster_id
+)
+
+-- Final Output: Flat cost data combining DBU costs and ACM costs
+SELECT
+    -- Job Run Identifiers
+    job_run_id,
+    job_id,
+    cluster_id,
+    job_name,
+    run_name,
+    
+    -- Job Run Metadata
+    job_start_time,
+    job_end_time,
+    duration_seconds,
+    duration_hours,
+    result_state,
+    termination_code,
+    trigger_type,
+    run_type,
+    creator_user_name,
+    run_as_user_name,
+    account_id,
+    workspace_id,
+    run_date,
+    
+    -- Organizational Tags
+    Team,
+    JobType,
+    Environment,
+    ClusterName,
+    DatabricksWorkspace,
+    ResourceClass,
+    
+    -- Azure Metadata
+    SubscriptionGuid,
+    ResourceGroup,
+    ResourceLocation,
+    InstanceId,
+    
+    -- Cost Line Item Details
+    cost_source,           -- 'System Tables' or 'ACM'
+    cost_category,         -- 'Azure Databricks', 'Virtual Machines', 'Storage', etc.
+    cost_subcategory,      -- Subcategory within category
+    cost_meter_name,       -- Meter display name
+    cost_meter_id,         -- Meter identifier
+    cost_amount,           -- Cost amount for this line item
+    usage_quantity,        -- Usage quantity
+    unit_of_measure,       -- Unit (DBU, Hours, GB, etc.)
+    unit_rate,             -- Rate per unit (if available)
+    currency,              -- Currency code
+    cost_date,             -- Date of the cost
+    
+    -- Processing metadata
+    CURRENT_TIMESTAMP() AS processed_at
+    
+FROM
+    (
+        -- ACM Costs (VM, Storage, Bandwidth, VNet, Defender)
+        SELECT * FROM acm_costs
+        
+        UNION ALL
+        
+        -- DBU Costs from System Tables
+        SELECT * FROM dbu_costs
+    )
+ORDER BY
+    job_run_id,
+    cost_source,
+    cost_category,
+    cost_amount DESC;
