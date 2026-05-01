@@ -1,0 +1,43 @@
+{
+    "job_name": "etl_daily_example",
+    "job_id": "1234567890",
+    "job_run_date": "2026-04-30",
+    "workspace_id": "1234567890",
+    "workspace_name": "example-workspace",
+    "cluster_id": "0101-abcdef-ghijk",
+    "run_start_time_utc": "2026-04-30T10:00:00Z",
+    "run_end_time_utc": "2026-04-30T10:25:40Z",
+    "duration_seconds": 1540,
+    "metrics_ingest_timestamp_utc": "2026-04-30T10:30:00Z",
+  
+    "azure_worker_vm_size": "Standard_E8s_v3",
+    "max_worker_nodes_cluster_ceiling": 17,
+    "total_vcpus_cluster_ceiling": 136.0,
+    "total_memory_gb_cluster_ceiling": 1088.0,
+  
+    "avg_worker_nodes_consumed": 2.0,
+    "p95_worker_nodes_consumed": 2,
+    "p99_worker_nodes_consumed": 2,
+    "avg_vcpus_allocated_active_cluster": 16.0,
+    "avg_memory_gb_allocated_active_cluster": 128.0,
+  
+    "avg_vcpus_utilized_by_workload": 6.09,
+    "avg_memory_gb_utilized_by_workload": 34.78,
+  
+    "cluster_avg_cpu_utilization_pct_of_ceiling_capacity": 4.48,
+    "cluster_avg_memory_utilization_pct_of_ceiling_capacity": 10.0,
+    "peak_cpu_utilization_pct_sample_window": 79.23,
+    "peak_memory_utilization_pct_sample_window": 42.55,
+  
+    "avg_cpu_user_pct": 32.12,
+    "avg_cpu_system_pct": 5.95,
+    "avg_cpu_wait_pct": 0.02,
+  
+    "workflow_task_count": 10,
+    "processed_row_count": 1024,
+    "processed_bytes": 391228,
+  
+    "provisioning_efficiency_pct": 11.76,
+    "cpu_utilization_efficiency_pct": 11.76,
+    "memory_utilization_efficiency_pct": 27.17
+  }
