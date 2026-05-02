@@ -9,11 +9,17 @@ description: Agent rules for Azure Databricks efficiency (ingest fields in body,
 
 **Mandatory:** Apply **`Metric Interpretation Rules`**, then Steps **1 through 5 in order**. Emit **one recommendation JSON object** conforming **`Output Expectations`**. Tie every recommendation to ingest field values cited in **`analysis_summary.key_evidence`** or **`comparison.rationale`**.
 
+**Primary lens:** **CPU and memory utilization** (**Consumed vs Utilized** ratios, **peak** metrics, **`cluster_avg_*_pct_of_ceiling_capacity`** as supporting aggregates). **Worker counts, autoscale min/max, and topology** align the **capacity shell** to that utilization story; they do **not** replace it.
+
+**Full procedure (no early exit):** **Always evaluate Steps 2, 3, and 4** when the ingest fields those steps require are present (otherwise document missing evidence in **`confidence_notes`** / **`INSUFFICIENT_EVIDENCE`**). **`OVERPROVISIONED_AUTOSCALE` or other Step 1 findings do not** waive Steps **2 through 5**. Never recommend **`recommended_configuration`** (SKU, **`min_workers`**/**`max_workers`**, **`cluster_topology`**) based **only** on Step 1; **`comparison.rationale`** and **`analysis_summary.key_evidence`** must reflect **allocated-vs-utilized CPU/memory** reasoning from Step **2** and, when **`recommended_configuration`** changes SKU / **`vm_family`** versus **`current_configuration`**, **VM family fit** from Step **4** (unless **`INSUFFICIENT_EVIDENCE`** states Step 4 inputs are missing).
+
 **Historical summaries** (when the user attaches them explicitly: e.g. `copilot-results/history-summary.{md,json}`): use only as secondary context **after** interpreting current-run metrics; **never** substitute for absent primary metrics **and** never assume access to unmanaged files.
 
 ---
 
 ## Core Optimization Principles
+
+Lead with **CPU and memory signals**: **Utilized versus allocated**, **peak** CPU/memory, diagnostics (**`avg_cpu_*_pct`**, especially **`avg_cpu_wait_pct`**), plus **`workflow_task_count`**. Treat **autoscaler ceilings**, **worker percentiles**, and **topology** as **how capacity is shaped**, so Steps **2-4** conclusions stay consistent with measured utilization (**Step 1** alone is shell context).
 
 ### 1. Minimum node size rule
 - **Never** recommend node types smaller than **8 vCPUs** (about **1** vCPU per node commonly reserved by platform overhead).
@@ -98,15 +104,19 @@ Use only to validate, not drive decisions:
 
 ## Required Analysis Procedure
 
-Follow this sequence.
+Follow this sequence **to completion**. Do **not** stop after Step 1.
 
 ### Step 1: Cluster ceiling vs consumed (autoscaler bounds)
 
+**Role:** Bounds the **capacity shell** (autoscaler/policy **max**, worker tails) so CPU/memory ratios in Steps **2-4** are read **in cluster context**. **Shell slack** is **not** the optimization target by itself.
+
 Compare **`max_worker_nodes_cluster_ceiling`** and **`total_vcpus_cluster_ceiling`** / **`total_memory_gb_cluster_ceiling`** versus **`avg_worker_nodes_consumed`**, **`p95_worker_nodes_consumed`**, **`p99_worker_nodes_consumed`**. Cross-check **`peak_cpu_utilization_pct_sample_window`**, **`peak_memory_utilization_pct_sample_window`**.
 
-If sustained gap shows **configured max materially above distributional need**, use **`OVERPROVISIONED_AUTOSCALE`**. In rationale: anchor on **burst headroom tolerance** (**not** unspent DBU unless user states committed capacity).
+If sustained gap shows **configured max materially above distributional need**, use **`OVERPROVISIONED_AUTOSCALE`**. In rationale: anchor on **burst headroom tolerance** (**not** unspent DBU unless user states committed capacity). **`OVERPROVISIONED_AUTOSCALE`** still requires **explicit Step 2 (and Steps 3-4 where applicable)** before final **`recommended_configuration`** (autoscale knobs, SKU, **`cluster_topology`**). **Step 2** must justify **whether** tightening workers is safe given **allocated-vs-utilized** CPU/memory and peaks. **Step 4** applies when **`recommended_configuration`** changes SKU or **`vm_family`** versus **`current_configuration`**, unless **`INSUFFICIENT_EVIDENCE`** states Step 4 inputs are missing.
 
-### Step 2: Consumed (`allocated`) vs utilized
+### Step 2: Consumed (`allocated`) vs utilized (**mandatory** before final sizing)
+
+**Role:** Grounds cost and saturation in **workload CPU and memory** versus what the cluster actually held (**Consumed** allocation). Pair with Step 4 for SKU/family conclusions.
 
 Apply SKU / series / **`PER_NODE_UNDERUTILIZED`** against shells that actually ran (**consumed allocation**):
 
@@ -117,6 +127,8 @@ Apply SKU / series / **`PER_NODE_UNDERUTILIZED`** against shells that actually r
 Low **utilized/allocated** ratio **given safe peaks**, use **`PER_NODE_UNDERUTILIZED`**. Still cite **`cluster_avg_*_pct_of_ceiling_capacity`** separately; orthogonal denominator.
 
 ### Step 3: Workflow orchestration parallelism
+
+**Role:** Explains whether **scaled-out workers** materially shorten the job or mainly add idle capacity (parallelism context for Steps **1-2** levers).
 
 **`workflow_task_count`** means Databricks workflow **tasks** (**not Spark executor parallelism**).
 
@@ -129,6 +141,8 @@ If the workflow consists of few tasks, runs primarily sequentially, or each task
 - `LOW_PARALLELISM`
 
 ### Step 4: Azure VM series (CPU vs RAM skew)
+
+**Role:** Turns **CPU and memory utilization shape** (**allocated vs utilized**, peaks, wait%) into **`vm_family` / SKU series** (**D**, **E**, **F**) and **`VM_FAMILY_MISMATCH`**. Evaluate **every** pass when SKU/family-change is on the table; default **keep current family** with explicit reasoning if ratios are balanced.
 
 Inputs: ratios **allocated versus utilized**, **`cluster_avg_*_pct_of_ceiling_capacity`**, peak `*_pct_sample_window`, diagnostics **`avg_cpu_user_pct|system_pct|wait_pct`**.
 
