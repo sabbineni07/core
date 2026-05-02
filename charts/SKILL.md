@@ -45,10 +45,23 @@ Assume **exactly these field names** in a flat JSON blob (omit keys when unknown
 
 **Suffix / prefix semantics:** **`_pct`** means percentage (**0-100** default); **`p95_`/`p99_`** means percentiles.
 
+**Driver and worker ingest (current vs upcoming)**
+
+**Current ingest (bundled telemetry):**
+
+- **`azure_worker_vm_size`** describes the **same Azure VM SKU** used for **both** the driver and the workers (**one** worker-type string applies to driver + executor nodes for this ingest).
+- **Node-count and cluster capacity fields bundle the driver**: **`max_worker_nodes_cluster_ceiling`**, **`avg_worker_nodes_consumed`**, **`p95_worker_nodes_consumed`**, **`p99_worker_nodes_consumed`**, **`total_vcpus_cluster_ceiling`**, **`total_memory_gb_cluster_ceiling`**, **`avg_vcpus_allocated_active_cluster`**, and **`avg_memory_gb_allocated_active_cluster`** are **aggregated totals that include the driver** with workers (upstream definition). Interpret **Ceiling**, **Consumed** node tails, and **Consumed** compute/RAM in Step 1 vs Step 2 **on that bundled basis**, **not** as workers-only.
+- When **`max_worker_nodes_cluster_ceiling` equals `1`**, treat as **single-node** posture for **this ingest** (capacity story matches one colocated footprint). **Classic** **`min_workers`/`max_workers` = `1`** is **still not** sufficient alone for **true single-node** topology (Step 5) when ingest is bundled.
+
+**Future ingest (split driver vs worker):**
+
+- When **`null`/missing**, keep **bundled rules** above. When **new driver-scoped and worker-scoped fields** arrive in the ingest (names will be appended to **`Metric Interpretation Rules`**), **prioritize worker-scoped** ceilings, consumed node counts, and allocated worker vCPU/memory for **Step 1-3** worker-pool/autoscale conclusions **prioritize driver-scoped** SKU and aggregates for **driver sizing** narratives and imbalance between driver vs workers. **Do not** use bundled cluster aggregates for worker-only slack if split fields supersede them for the same notion.
+- If bundled and split fields **both appear** temporarily, prefer **split** fields for contradictory concepts and note overlap in **`confidence_notes`**.
+
 **Three capacity layers (tie Steps 1-2)**
 
-- **Ceiling:** configured autoscaler/policy **max**. **Fields:** `max_worker_nodes_cluster_ceiling`, `total_vcpus_cluster_ceiling`, `total_memory_gb_cluster_ceiling`
-- **Consumed:** allocated active worker pool for the window (**avg** + percentiles). **Fields:** `avg_worker_nodes_consumed`, `p95_worker_nodes_consumed`, `p99_worker_nodes_consumed`, `avg_vcpus_allocated_active_cluster`, `avg_memory_gb_allocated_active_cluster`
+- **Ceiling:** configured autoscaler/policy **max** (see **bundled** vs split rules above). **Fields:** `max_worker_nodes_cluster_ceiling`, `total_vcpus_cluster_ceiling`, `total_memory_gb_cluster_ceiling`
+- **Consumed:** allocation over the window: node **avg** + percentiles and **cluster** allocated vCPU/RAM (**bundled ingest** counts driver with workers **not** workers-only). **Fields:** `avg_worker_nodes_consumed`, `p95_worker_nodes_consumed`, `p99_worker_nodes_consumed`, `avg_vcpus_allocated_active_cluster`, `avg_memory_gb_allocated_active_cluster`
 - **Utilized:** workload use **inside** consumed capacity. **Fields:** `avg_vcpus_utilized_by_workload`, `avg_memory_gb_utilized_by_workload`
 
 **Ratios:** if denominators **`> 0`**:
@@ -69,11 +82,11 @@ Else **`INSUFFICIENT_EVIDENCE`** / skip ratio; never fabricate divisors.
 
 ### Primary decision metrics (high signal)
 
-- **`azure_worker_vm_size`:** Worker VM SKU string (signals series and per-node footprint).
-- **`max_worker_nodes_cluster_ceiling`:** Max workers allowed by autoscaler/policy (**Ceiling**).
-- **`total_vcpus_cluster_ceiling`**, **`total_memory_gb_cluster_ceiling`:** Cluster-wide vCPU and memory at ceiling (**Ceiling**).
-- **`avg_worker_nodes_consumed`**, **`p95_worker_nodes_consumed`**, **`p99_worker_nodes_consumed`:** Active worker count over the window: average and tails (**Consumed**).
-- **`avg_vcpus_allocated_active_cluster`**, **`avg_memory_gb_allocated_active_cluster`:** Resources on nodes that ran (allocated shell around the workload; **Consumed**).
+- **`azure_worker_vm_size`:** Azure VM SKU for **drivers and workers** (**same SKU** until split ingest exposes a driver SKU separately).
+- **`max_worker_nodes_cluster_ceiling`:** Bundled ingest: ceiling **includes driver** with workers (not workers-only); value **`1`** matches **single-node** ingest posture (**Driver and worker ingest**).
+- **`total_vcpus_cluster_ceiling`**, **`total_memory_gb_cluster_ceiling`:** Bundled: **cluster** vCPU/memory **ceiling includes driver**.
+- **`avg_worker_nodes_consumed`**, **`p95_worker_nodes_consumed`**, **`p99_worker_nodes_consumed`:** Bundled: node-count shape **includes driver** (**Consumed** tails for Step 1).
+- **`avg_vcpus_allocated_active_cluster`**, **`avg_memory_gb_allocated_active_cluster`:** Bundled: **allocated** totals **include driver RAM/vCPU denominator** (**Consumed**).
 - **`avg_vcpus_utilized_by_workload`**, **`avg_memory_gb_utilized_by_workload`:** Workload-attributed use inside that shell (**Utilized**).
 - **`cluster_avg_cpu_utilization_pct_of_ceiling_capacity`**, **`cluster_avg_memory_utilization_pct_of_ceiling_capacity`:** Cluster aggregates versus ceiling (0-100); use with ratios above, never as a substitute for **Utilized**/allocated splits.
 - **`workflow_task_count`:** Count of job workflow tasks (orchestration step count, not Spark executor parallelism).
@@ -168,6 +181,8 @@ Runs **after** Steps 1-3; obey **Core Optimization Principles section 2** orderi
 ### Step 5: Single-node topology (**true** driver+executor VM)
 
 **`single-node` here** means **Databricks single-node topology** (**one VM** colocates driver **and** workloads). **`autoscale.min==max==1`** on classic often **still means driver+worker (2-node)**; that signal alone is insufficient.
+
+**Bundled ingest:** **`p95`/`p99`/`avg` node counts** below follow **Driver and worker ingest** (**driver included**). When split worker-only metrics exist, use those for worker tail shapes instead.
 
 Eligible pattern examples:
 - **`p95_worker_nodes_consumed`** or **`p99_worker_nodes_consumed`** is less than or equal to **2**
