@@ -1,6 +1,6 @@
 ---
 name: databricks-efficiency
-description: Agent rules for Azure Databricks efficiency (ingest fields in body, ceiling vs consumed vs utilized, VM series D E F, autoscale/topology; no peak CPU/memory utilization samples); output strict recommendation JSON schema_version 2.0.0.
+description: Agent rules for Azure Databricks efficiency (ingest fields in body, ceiling vs consumed vs utilized, VM series D E F, autoscale/topology; no peak CPU/memory samples; +20 planning buffer; 4 vCPU floor; minimal-worker rightsizing preference); output strict recommendation JSON schema_version 2.0.0.
 ---
 
 ### Agent directives (read first)
@@ -10,6 +10,10 @@ description: Agent rules for Azure Databricks efficiency (ingest fields in body,
 **Mandatory:** Apply **`Metric Interpretation Rules`**, then Steps **1 through 5 in order**. Emit **one recommendation JSON object** conforming **`Output Expectations`**. Tie every recommendation to ingest field values cited in **`analysis_summary.key_evidence`** or **`comparison.rationale`**.
 
 **Primary lens:** **CPU and memory utilization** (**Consumed vs Utilized** ratios, **`cluster_avg_*_pct_of_ceiling_capacity`** as supporting aggregates, worker **`p95`/`p99`** tails, CPU diagnostics). **Worker counts, autoscale min/max, and topology** align the **capacity shell** to that utilization story; they do **not** replace it.
+
+**Planning buffer (no peak samples):** For **CPU** and **memory** separately, compute **utilized percentage of allocated** (**0-100**) from **`avg_*_utilized_by_workload / avg_*_allocated_active_cluster`**. Treat **`min(100, observed_pct + 20)`** as the **minimum stress-planning level** for sizing and shrink decisions **do not** invent unstated spike headroom. Other margins require **`confidence_notes`**.
+
+**Minimal-worker rightsizing:** When **`avg_worker_nodes_consumed`** and **`p99_worker_nodes_consumed`** are both **`<= 1`** (bundled ingest rules apply) **and** both dimensions stay **persistently low** per **Core Optimization Principles**, **prefer** explicit **SKU / VM family** evaluation (**Step 4**) **do not** treat **autoscale ceiling-only** changes as a complete cost outcome without rationale on rightsizing.
 
 **Full procedure (no early exit):** **Always evaluate Steps 2, 3, and 4** when the ingest fields those steps require are present (otherwise document missing evidence in **`confidence_notes`** / **`INSUFFICIENT_EVIDENCE`**). **`OVERPROVISIONED_AUTOSCALE` or other Step 1 findings do not** waive Steps **2 through 5**. Never recommend **`recommended_configuration`** (SKU, **`min_workers`**/**`max_workers`**, **`cluster_topology`**) based **only** on Step 1; **`comparison.rationale`** and **`analysis_summary.key_evidence`** must reflect **allocated-vs-utilized CPU/memory** reasoning from Step **2** and, when **`recommended_configuration`** changes SKU / **`vm_family`** versus **`current_configuration`**, **VM family fit** from Step **4** (unless **`INSUFFICIENT_EVIDENCE`** states Step 4 inputs are missing).
 
@@ -22,13 +26,14 @@ description: Agent rules for Azure Databricks efficiency (ingest fields in body,
 Lead with **CPU and memory signals**: **Utilized versus allocated**, diagnostics (**`avg_cpu_*_pct`**, especially **`avg_cpu_wait_pct`**), worker **`p95`/`p99`** node tails, **`cluster_avg_*_pct_of_ceiling_capacity`**, plus **`workflow_task_count`**. Treat **autoscaler ceilings**, **worker percentiles**, and **topology** as **how capacity is shaped**, so Steps **2-4** conclusions stay consistent with measured utilization (**Step 1** alone is shell context).
 
 ### 1. Minimum node size rule
-- **Never** recommend node types smaller than **8 vCPUs** (about **1** vCPU per node commonly reserved by platform overhead).
+- **Never** recommend node types smaller than **4 vCPUs** per node (platform may still reserve a fraction of vCPU per node).
 
 ### 2. Prefer reducing node count before shrinking node size
 - Order levers when idle: tighten **workers / autoscale** before smaller SKUs unless Step 2 already shows **allocated-vs-utilized** saturation.
-- When node count is **already low** (for example, **`min_workers`** and actual consumption are at a practical floor, or further reduction would conflict with parallelism or headroom), treat **node-count reduction** as **exhausted** for this pass. Then prefer **rightsizing**: a **smaller SKU** within the **8 vCPU minimum** rule and/or a **better-fitting VM family** (see Step 4), **only when metrics** (**allocated vs utilized** ratios, **`cluster_avg_*_utilization_pct_of_ceiling_capacity`**, **`workflow_task_count`**, node percentiles) **show sustained headroom**. Document uncertainty in **`confidence_notes`** or impact fields rather than implying zero performance risk.
+- **Minimal workers + persistently low utilization:** When **`avg_worker_nodes_consumed`** and **`p99_worker_nodes_consumed`** are both **`<= 1`** (see **Driver and worker ingest**) **and** **both** CPU and memory **utilized-to-allocated** percentages (**0-100** from the ratios) are **below ~40%** on window averages, **prefer** **SKU and VM family rightsizing** (**Step 4**) alongside or instead of **only** narrowing **`max_workers`**. **`comparison.rationale`** that **only** tightens autoscale **must justify** skipping rightsizing (**INSUFFICIENT_EVIDENCE**, pipeline lock, or documented risk in **`confidence_notes`**). Apply the **Planning buffer** (**Metric Interpretation Rules**) before claiming extra invisible headroom.
+- When node count is **already low** (for example, **`min_workers`** and actual consumption are at a practical floor, or further reduction would conflict with parallelism or headroom), treat **node-count reduction** as **exhausted** for this pass. Then prefer **rightsizing**: a **smaller SKU** within the **4 vCPU minimum** rule and/or a **better-fitting VM family** (see Step 4), **only when metrics** (**allocated vs utilized** ratios, **`cluster_avg_*_utilization_pct_of_ceiling_capacity`**, **`workflow_task_count`**, node percentiles) **show sustained headroom**. Document uncertainty in **`confidence_notes`** or impact fields rather than implying zero performance risk.
 - If the workload is very small and lightly parallelized, evaluate whether switching to a **single-node cluster topology** is justified (see Step 5).
-- Do not recommend shrinking below 8 vCPUs per node.
+- Do not recommend shrinking below **4 vCPUs** per node.
 
 ### 3. Evidence binding
 - Map every SKU/topology/`reason_codes[]` change to **observed ingest fields** (or **`INSUFFICIENT_EVIDENCE`** / **`NO_CHANGE_RECOMMENDED`**).
@@ -76,6 +81,8 @@ Else **`INSUFFICIENT_EVIDENCE`** / skip ratio; never fabricate divisors.
 - **`cluster_avg_cpu_utilization_pct_of_ceiling_capacity`**, **`cluster_avg_memory_utilization_pct_of_ceiling_capacity`**
 
 **Ingest omits sample-window peak CPU/memory utilization:** **Do not** expect or cite **`peak_cpu_utilization_pct_sample_window`** or **`peak_memory_utilization_pct_sample_window`**. Use **averages**, **`p95`/`p99`** worker node counts, **`cluster_avg_*_pct_of_ceiling_capacity`**, and **`confidence_notes`** when burst risk is plausible but unobserved.
+
+**Planning buffer** (same rule as **Agent directives**): convert each ratio to **utilized percent of allocated** (**0-100**), then use **`min(100, observed_pct + 20)`** per dimension when judging shrink, rightsizing, or family moves.
 
 **Supplemental throughput (never outweigh utilization):** **`processed_row_count`**, **`processed_bytes`**
 
@@ -125,7 +132,7 @@ Follow this sequence **to completion**. Do **not** stop after Step 1.
 
 Compare **`max_worker_nodes_cluster_ceiling`** and **`total_vcpus_cluster_ceiling`** / **`total_memory_gb_cluster_ceiling`** versus **`avg_worker_nodes_consumed`**, **`p95_worker_nodes_consumed`**, **`p99_worker_nodes_consumed`**.
 
-If sustained gap shows **configured max materially above distributional need**, use **`OVERPROVISIONED_AUTOSCALE`**. In rationale: anchor on **burst headroom tolerance** (**not** unspent DBU unless user states committed capacity). **`OVERPROVISIONED_AUTOSCALE`** still requires **explicit Step 2 (and Steps 3-4 where applicable)** before final **`recommended_configuration`** (autoscale knobs, SKU, **`cluster_topology`**). **Step 2** must justify **whether** tightening workers is safe given **allocated-vs-utilized** CPU/memory (no peak utilization samples in ingest). **Step 4** applies when **`recommended_configuration`** changes SKU or **`vm_family`** versus **`current_configuration`**, unless **`INSUFFICIENT_EVIDENCE`** states Step 4 inputs are missing.
+If sustained gap shows **configured max materially above distributional need**, use **`OVERPROVISIONED_AUTOSCALE`**. In rationale: anchor on **burst headroom tolerance** (**not** unspent DBU unless user states committed capacity). **`OVERPROVISIONED_AUTOSCALE`** still requires **explicit Step 2 (and Steps 3-4 where applicable)** before final **`recommended_configuration`** (autoscale knobs, SKU, **`cluster_topology`**). **Step 2** must justify **whether** tightening workers is safe given **allocated-vs-utilized** CPU/memory (no peak utilization samples in ingest). **Step 4** applies when **`recommended_configuration`** changes SKU or **`vm_family`** versus **`current_configuration`**, unless **`INSUFFICIENT_EVIDENCE`** states Step 4 inputs are missing. When **Core Optimization Principles** **minimal-worker rightsizing** policy applies, **`comparison.rationale`** cannot rely on **`max_workers`** ceiling tightening **alone** **without** addressing **Step 4** SKU/family fit **unless** it documents why rightsizing is skipped.
 
 ### Step 2: Consumed (`allocated`) vs utilized (**mandatory** before final sizing)
 
@@ -135,7 +142,7 @@ Apply SKU / series / **`PER_NODE_UNDERUTILIZED`** against shells that actually r
 
 - Ratio **`avg_vcpus_utilized_by_workload / avg_vcpus_allocated_active_cluster`**
 - Ratio **`avg_memory_gb_utilized_by_workload / avg_memory_gb_allocated_active_cluster`**
-- Triangulate with **`p95_worker_nodes_consumed`** / **`p99_worker_nodes_consumed`** and **`cluster_avg_*_pct_of_ceiling_capacity`** before aggressive shrink. **Without** peak utilization samples in ingest, prefer conservative deltas **or** explain burst uncertainty in **`confidence_notes`**.
+- Triangulate with **`p95_worker_nodes_consumed`** / **`p99_worker_nodes_consumed`** and **`cluster_avg_*_pct_of_ceiling_capacity`** before aggressive shrink. Apply the **Planning buffer** to **utilized percent of allocated** (CPU and memory separately). **Without** peak utilization samples in ingest, prefer conservative deltas **or** explain residual uncertainty in **`confidence_notes`**.
 
 Low **utilized/allocated** ratio **when worker tails and vs-ceiling aggregates do not contradict aggressive shrink**, use **`PER_NODE_UNDERUTILIZED`**. Still cite **`cluster_avg_*_pct_of_ceiling_capacity`** separately; orthogonal denominator.
 
@@ -202,7 +209,7 @@ If single-node is recommended, emit JSON **`cluster_topology:"single_node"`** an
 ## Recommendation Rules
 
 ### VM Sizing
-- Maintain a minimum of **8 vCPUs per node**.
+- Maintain a minimum of **4 vCPUs per node**.
 - Prefer reducing node count before recommending different node sizes (Core Optimization Principles section 2, including rightsizing SKU or family when count is already low).
 - Apply **Step 4** when choosing or changing **Azure D / E / F** series so CPU versus GiB utilization skew stays consistent.
 - If changing family or SKU, ensure proposed memory is sufficient for observed workload behavior, **`cluster_avg_*_pct_of_ceiling_capacity`** story, and shuffle/broadcast/cache risk.
@@ -217,7 +224,7 @@ If single-node is recommended, emit JSON **`cluster_topology:"single_node"`** an
 
 
 ### Reason codes `NO_CHANGE_RECOMMENDED` and `INSUFFICIENT_EVIDENCE`
-- **`NO_CHANGE_RECOMMENDED`:** Metrics support that **no safe cost change** is warranted (for example, already at minimum viable 8 vCPU footprint, rightsizing would add operational risk without evidence, or pipeline constraints block change). Use with **`change_required`: false** and recommended configuration **mirroring** current.
+- **`NO_CHANGE_RECOMMENDED`:** Metrics support that **no safe cost change** is warranted (for example, already at minimum viable **4 vCPU** footprint, rightsizing would add operational risk without evidence, or pipeline constraints block change). Use with **`change_required`: false** and recommended configuration **mirroring** current.
 - **`INSUFFICIENT_EVIDENCE`:** Primary metrics **missing**, **incomplete**, **not representative** (partial/cold-run), **or required denominators are zero/absent** (cannot trust allocated-vs-utilized ratios). Prefer **`change_required`: false**, explain gaps in **`confidence_notes`**, and avoid speculative family or topology changes.
 
 ---
@@ -292,7 +299,7 @@ Respond **exactly once** as **strict JSON**. Schema = below contract + verbatim 
       "azure_node_type": "",
       "vm_family": "",
       "vm_generation": "",
-      "vcpus_per_node": 0,
+      "vcpus_per_node": 4,
       "memory_gb_per_node": 0,
       "cluster_topology": "multi_node|single_node",
       "autoscale": {
@@ -305,7 +312,7 @@ Respond **exactly once** as **strict JSON**. Schema = below contract + verbatim 
       "azure_node_type": "",
       "vm_family": "",
       "vm_generation": "",
-      "vcpus_per_node": 0,
+      "vcpus_per_node": 4,
       "memory_gb_per_node": 0,
       "cluster_topology": "multi_node|single_node",
       "autoscale": {
