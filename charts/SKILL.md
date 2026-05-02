@@ -1,6 +1,6 @@
 ---
 name: databricks-efficiency
-description: Agent rules for Azure Databricks efficiency (ingest fields in body, ceiling vs consumed vs utilized, VM series D E F, autoscale/topology); output strict recommendation JSON schema_version 2.0.0.
+description: Agent rules for Azure Databricks efficiency (ingest fields in body, ceiling vs consumed vs utilized, VM series D E F, autoscale/topology; no peak CPU/memory utilization samples); output strict recommendation JSON schema_version 2.0.0.
 ---
 
 ### Agent directives (read first)
@@ -9,7 +9,7 @@ description: Agent rules for Azure Databricks efficiency (ingest fields in body,
 
 **Mandatory:** Apply **`Metric Interpretation Rules`**, then Steps **1 through 5 in order**. Emit **one recommendation JSON object** conforming **`Output Expectations`**. Tie every recommendation to ingest field values cited in **`analysis_summary.key_evidence`** or **`comparison.rationale`**.
 
-**Primary lens:** **CPU and memory utilization** (**Consumed vs Utilized** ratios, **peak** metrics, **`cluster_avg_*_pct_of_ceiling_capacity`** as supporting aggregates). **Worker counts, autoscale min/max, and topology** align the **capacity shell** to that utilization story; they do **not** replace it.
+**Primary lens:** **CPU and memory utilization** (**Consumed vs Utilized** ratios, **`cluster_avg_*_pct_of_ceiling_capacity`** as supporting aggregates, worker **`p95`/`p99`** tails, CPU diagnostics). **Worker counts, autoscale min/max, and topology** align the **capacity shell** to that utilization story; they do **not** replace it.
 
 **Full procedure (no early exit):** **Always evaluate Steps 2, 3, and 4** when the ingest fields those steps require are present (otherwise document missing evidence in **`confidence_notes`** / **`INSUFFICIENT_EVIDENCE`**). **`OVERPROVISIONED_AUTOSCALE` or other Step 1 findings do not** waive Steps **2 through 5**. Never recommend **`recommended_configuration`** (SKU, **`min_workers`**/**`max_workers`**, **`cluster_topology`**) based **only** on Step 1; **`comparison.rationale`** and **`analysis_summary.key_evidence`** must reflect **allocated-vs-utilized CPU/memory** reasoning from Step **2** and, when **`recommended_configuration`** changes SKU / **`vm_family`** versus **`current_configuration`**, **VM family fit** from Step **4** (unless **`INSUFFICIENT_EVIDENCE`** states Step 4 inputs are missing).
 
@@ -19,7 +19,7 @@ description: Agent rules for Azure Databricks efficiency (ingest fields in body,
 
 ## Core Optimization Principles
 
-Lead with **CPU and memory signals**: **Utilized versus allocated**, **peak** CPU/memory, diagnostics (**`avg_cpu_*_pct`**, especially **`avg_cpu_wait_pct`**), plus **`workflow_task_count`**. Treat **autoscaler ceilings**, **worker percentiles**, and **topology** as **how capacity is shaped**, so Steps **2-4** conclusions stay consistent with measured utilization (**Step 1** alone is shell context).
+Lead with **CPU and memory signals**: **Utilized versus allocated**, diagnostics (**`avg_cpu_*_pct`**, especially **`avg_cpu_wait_pct`**), worker **`p95`/`p99`** node tails, **`cluster_avg_*_pct_of_ceiling_capacity`**, plus **`workflow_task_count`**. Treat **autoscaler ceilings**, **worker percentiles**, and **topology** as **how capacity is shaped**, so Steps **2-4** conclusions stay consistent with measured utilization (**Step 1** alone is shell context).
 
 ### 1. Minimum node size rule
 - **Never** recommend node types smaller than **8 vCPUs** (about **1** vCPU per node commonly reserved by platform overhead).
@@ -74,9 +74,10 @@ Else **`INSUFFICIENT_EVIDENCE`** / skip ratio; never fabricate divisors.
 **Vs-ceiling aggregates (never replace ratios):**
 
 - **`cluster_avg_cpu_utilization_pct_of_ceiling_capacity`**, **`cluster_avg_memory_utilization_pct_of_ceiling_capacity`**
-- Peaks **`peak_cpu_utilization_pct_sample_window`**, **`peak_memory_utilization_pct_sample_window`**
 
-**Supplemental throughput (never outweigh utilization/peaks):** **`processed_row_count`**, **`processed_bytes`**
+**Ingest omits sample-window peak CPU/memory utilization:** **Do not** expect or cite **`peak_cpu_utilization_pct_sample_window`** or **`peak_memory_utilization_pct_sample_window`**. Use **averages**, **`p95`/`p99`** worker node counts, **`cluster_avg_*_pct_of_ceiling_capacity`**, and **`confidence_notes`** when burst risk is plausible but unobserved.
+
+**Supplemental throughput (never outweigh utilization):** **`processed_row_count`**, **`processed_bytes`**
 
 **Consumption-billing heuristic:** SKU waste targets **Consumed vs Utilized**; tightening **Ceiling vs Consumed** guards burst/guardrail misalignment, not spend on dormant nodes.
 
@@ -104,7 +105,6 @@ Use only to validate, not drive decisions:
 ### Diagnostic metrics (context only)
 
 - **`avg_cpu_user_pct`**, **`avg_cpu_system_pct`**, **`avg_cpu_wait_pct`**
-- **`peak_cpu_utilization_pct_sample_window`**, **`peak_memory_utilization_pct_sample_window`**
 
 ### Ignore for optimization logic
 
@@ -123,9 +123,9 @@ Follow this sequence **to completion**. Do **not** stop after Step 1.
 
 **Role:** Bounds the **capacity shell** (autoscaler/policy **max**, worker tails) so CPU/memory ratios in Steps **2-4** are read **in cluster context**. **Shell slack** is **not** the optimization target by itself.
 
-Compare **`max_worker_nodes_cluster_ceiling`** and **`total_vcpus_cluster_ceiling`** / **`total_memory_gb_cluster_ceiling`** versus **`avg_worker_nodes_consumed`**, **`p95_worker_nodes_consumed`**, **`p99_worker_nodes_consumed`**. Cross-check **`peak_cpu_utilization_pct_sample_window`**, **`peak_memory_utilization_pct_sample_window`**.
+Compare **`max_worker_nodes_cluster_ceiling`** and **`total_vcpus_cluster_ceiling`** / **`total_memory_gb_cluster_ceiling`** versus **`avg_worker_nodes_consumed`**, **`p95_worker_nodes_consumed`**, **`p99_worker_nodes_consumed`**.
 
-If sustained gap shows **configured max materially above distributional need**, use **`OVERPROVISIONED_AUTOSCALE`**. In rationale: anchor on **burst headroom tolerance** (**not** unspent DBU unless user states committed capacity). **`OVERPROVISIONED_AUTOSCALE`** still requires **explicit Step 2 (and Steps 3-4 where applicable)** before final **`recommended_configuration`** (autoscale knobs, SKU, **`cluster_topology`**). **Step 2** must justify **whether** tightening workers is safe given **allocated-vs-utilized** CPU/memory and peaks. **Step 4** applies when **`recommended_configuration`** changes SKU or **`vm_family`** versus **`current_configuration`**, unless **`INSUFFICIENT_EVIDENCE`** states Step 4 inputs are missing.
+If sustained gap shows **configured max materially above distributional need**, use **`OVERPROVISIONED_AUTOSCALE`**. In rationale: anchor on **burst headroom tolerance** (**not** unspent DBU unless user states committed capacity). **`OVERPROVISIONED_AUTOSCALE`** still requires **explicit Step 2 (and Steps 3-4 where applicable)** before final **`recommended_configuration`** (autoscale knobs, SKU, **`cluster_topology`**). **Step 2** must justify **whether** tightening workers is safe given **allocated-vs-utilized** CPU/memory (no peak utilization samples in ingest). **Step 4** applies when **`recommended_configuration`** changes SKU or **`vm_family`** versus **`current_configuration`**, unless **`INSUFFICIENT_EVIDENCE`** states Step 4 inputs are missing.
 
 ### Step 2: Consumed (`allocated`) vs utilized (**mandatory** before final sizing)
 
@@ -135,9 +135,9 @@ Apply SKU / series / **`PER_NODE_UNDERUTILIZED`** against shells that actually r
 
 - Ratio **`avg_vcpus_utilized_by_workload / avg_vcpus_allocated_active_cluster`**
 - Ratio **`avg_memory_gb_utilized_by_workload / avg_memory_gb_allocated_active_cluster`**
-- Peaks **`peak_cpu_utilization_pct_sample_window`** and **`peak_memory_utilization_pct_sample_window`** to avoid shrinking into transient spikes.
+- Triangulate with **`p95_worker_nodes_consumed`** / **`p99_worker_nodes_consumed`** and **`cluster_avg_*_pct_of_ceiling_capacity`** before aggressive shrink. **Without** peak utilization samples in ingest, prefer conservative deltas **or** explain burst uncertainty in **`confidence_notes`**.
 
-Low **utilized/allocated** ratio **given safe peaks**, use **`PER_NODE_UNDERUTILIZED`**. Still cite **`cluster_avg_*_pct_of_ceiling_capacity`** separately; orthogonal denominator.
+Low **utilized/allocated** ratio **when worker tails and vs-ceiling aggregates do not contradict aggressive shrink**, use **`PER_NODE_UNDERUTILIZED`**. Still cite **`cluster_avg_*_pct_of_ceiling_capacity`** separately; orthogonal denominator.
 
 ### Step 3: Workflow orchestration parallelism
 
@@ -155,24 +155,24 @@ If the workflow consists of few tasks, runs primarily sequentially, or each task
 
 ### Step 4: Azure VM series (CPU vs RAM skew)
 
-**Role:** Turns **CPU and memory utilization shape** (**allocated vs utilized**, peaks, wait%) into **`vm_family` / SKU series** (**D**, **E**, **F**) and **`VM_FAMILY_MISMATCH`**. Evaluate **every** pass when SKU/family-change is on the table; default **keep current family** with explicit reasoning if ratios are balanced.
+**Role:** Turns **CPU and memory utilization shape** (**allocated vs utilized**, wait%) into **`vm_family` / SKU series** (**D**, **E**, **F**) and **`VM_FAMILY_MISMATCH`**. Evaluate **every** pass when SKU/family-change is on the table; default **keep current family** with explicit reasoning if ratios are balanced.
 
-Inputs: ratios **allocated versus utilized**, **`cluster_avg_*_pct_of_ceiling_capacity`**, peak `*_pct_sample_window`, diagnostics **`avg_cpu_user_pct|system_pct|wait_pct`**.
+Inputs: ratios **allocated versus utilized**, **`cluster_avg_*_pct_of_ceiling_capacity`**, diagnostics **`avg_cpu_user_pct|system_pct|wait_pct`**.
 
-- **GiB-heavy:** elevated memory ratio / **`peak_memory_utilization_pct_sample_window`** / shuffle-cache narrative; take an **E** stance; mismatched **D|F** with stress, use **`VM_FAMILY_MISMATCH`** toward **memory-rightsizing**/**E**.
+- **GiB-heavy:** elevated memory ratio / shuffle-cache narrative; take an **E** stance; mismatched **D|F** with stress, use **`VM_FAMILY_MISMATCH`** toward **memory-rightsizing**/**E**.
 - **CPU-heavy + memory slack:** conversely consider **F** **only if** **`avg_cpu_wait_pct`** excludes pure I/O-wait pathology; otherwise prefer **E-to-D** bias first.
 - **Balanced:** default to **D**. **`processed_*`** optional weight only.
 
 Runs **after** Steps 1-3; obey **Core Optimization Principles section 2** ordering before series churn.
 
 **E-series:**
-- Prefer when memory pressure dominates: high **`avg_memory_gb_utilized_by_workload` / `avg_memory_gb_allocated_active_cluster`**, high **`peak_memory_utilization_pct_sample_window`**, or shuffle/broadcast/cache behavior.
+- Prefer when memory pressure dominates: high **`avg_memory_gb_utilized_by_workload` / `avg_memory_gb_allocated_active_cluster`**, high **`cluster_avg_memory_utilization_pct_of_ceiling_capacity`**, or shuffle/broadcast/cache behavior.
 - Use **CPU diagnostics** (for example **`avg_cpu_wait_pct`**) so **I/O-bound or waiting** CPUs are **not** read as spare compute that warrants **F**; fix bottlenecks first.
-- **`INSUFFICIENT_EVIDENCE`** or conservative **`NO_CHANGE`** when spikes or shuffle make averages misleading alone.
+- **`INSUFFICIENT_EVIDENCE`** or conservative **`NO_CHANGE`** when shuffle-heavy stages or noisy averages alone make family choice unclear.
 
 **F-series:**
 - Prefer evaluating **F** only when the run shows a **compute-bound** profile with **clear memory headroom** on **`azure_worker_vm_size`** (solid **`avg_vcpus_utilized_by_workload` / `avg_vcpus_allocated_active_cluster`**, subdued memory ratio or **`cluster_avg_memory_utilization_pct_of_ceiling_capacity`** story) sustained across the window, not partial/cold-start except as noted in **`confidence_notes`**.
-- **Do not** recommend **F** if memory ratios or **`peak_memory_utilization_pct_sample_window`** contradict headroom claims, or shuffle/broadcast/cache risk is material.
+- **Do not** recommend **F** if memory ratios **or** **`cluster_avg_memory_utilization_pct_of_ceiling_capacity`** contradict headroom claims, or shuffle/broadcast/cache risk is material.
 - **High `avg_cpu_wait_pct` alone is not grounds for F**; triangulate disk, network, shuffle, and driver bottlenecks separately from insufficient CPU capacity.
 - **E-series to D-series** often suffices when the problem is "**memory-series without memory justification**"; move to **F** when the narrative is specifically **needed compute density per GiB**, not merely "**wrong series**."
 
@@ -205,10 +205,10 @@ If single-node is recommended, emit JSON **`cluster_topology:"single_node"`** an
 - Maintain a minimum of **8 vCPUs per node**.
 - Prefer reducing node count before recommending different node sizes (Core Optimization Principles section 2, including rightsizing SKU or family when count is already low).
 - Apply **Step 4** when choosing or changing **Azure D / E / F** series so CPU versus GiB utilization skew stays consistent.
-- If changing family or SKU, ensure proposed memory is sufficient for observed workload behavior, peaks, and shuffle/broadcast/cache risk.
+- If changing family or SKU, ensure proposed memory is sufficient for observed workload behavior, **`cluster_avg_*_pct_of_ceiling_capacity`** story, and shuffle/broadcast/cache risk.
 
 ### Single-node memory rule
-- When recommending a single-node topology, do not recommend **`memory_gb_per_node`** lower than evidenced need from **`avg_memory_gb_utilized_by_workload`** (and peaks / pipeline risk) unless explicitly marked as a validation candidate.
+- When recommending a single-node topology, do not recommend **`memory_gb_per_node`** lower than evidenced need from **`avg_memory_gb_utilized_by_workload`** (and pipeline risk) unless explicitly marked as a validation candidate.
 - If memory headroom is unclear, prefer a safer recommendation over an aggressively smaller footprint.
 
 ### Topology vs autoscale
