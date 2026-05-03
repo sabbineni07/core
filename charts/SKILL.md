@@ -9,6 +9,8 @@ description: Azure Databricks cost-aware cluster optimization; ingest metrics in
 
 **Default stance:** **Prefer** evaluating **cheaper or better-matching** family/SKU when utilization supports it **avoid** keeping the current **`azure_worker_vm_size`** / **`vm_family`** without **metric-backed** justification (same as recommending a change).
 
+**Platform preference (when SKU choice is otherwise equivalent):** Prefer **newer-generation** Azure VM families (**v5** over **v3**, etc., for the same series/size intent) and SKUs that include **local ephemeral (temp) SSD** where Azure naming applies (**`d`** in the size name, e.g. **Eds**/**Dds**-style sizes **not** literally every SKU). **Only when** it fits memory/compute needs and policy **briefly justify** in **`comparison.rationale`** or config **`notes`** if you pick older gen or no local SSD.
+
 ---
 
 ### Scope
@@ -88,7 +90,11 @@ Emit **`reason_codes`** (length **>= 1**) **only** from:
 
 Return **strict JSON once**. Prefer stable key order as in sample.
 
-**MUST:** All SKU/topo/autoscale deltas live under **`comparison.current_configuration`** / **`comparison.recommended_configuration`**. Gate with **`comparison.change_required`** + **`comparison.rationale`** (bullet strings with metric keys). If **`change_required`: false**, clone **current** to **recommended** + neutral **`expected_directional_impact`** unless **`confidence_notes`** exception. **`comparison.single_node`** only **`eligible`**/**`recommended`**/**`notes[]`** **never** hide sizing there.
+**MUST:** All SKU/topo/autoscale deltas live under **`comparison.current_configuration`** / **`comparison.recommended_configuration`**. Gate with **`comparison.change_required`** + **`comparison.rationale`**.
+
+**Explanation depth:** **`comparison.rationale`** **must** be **multiple** bullet strings (**not** single vague lines). **Each** bullet should cite **specific ingest keys** and **why** that drives the recommendation (family fit, worker/autoscale, cost vs risk). **`analysis_summary.cluster_level_state`** and **`per_node_efficiency`** **must** be substantive (multi-sentence strings as needed) **`key_evidence`** **must** list the **main** metric keys used. Use **`current_configuration.notes`** / **`recommended_configuration.notes`** for SKU generation (**v3** vs **v5**, **`d`** temp SSD) or constraints when helpful **`confidence_notes`** for uncertainty.
+
+If **`change_required`: false**, clone **current** to **recommended** + neutral **`expected_directional_impact`** unless **`confidence_notes`** exception. **`comparison.single_node`** only **`eligible`**/**`recommended`**/**`notes[]`** **never** hide sizing there.
 
 **MUST NOT:** Invent stats extra recommendation trees outside **`comparison`**.
 
