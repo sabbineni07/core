@@ -1,21 +1,23 @@
 ---
 name: databricks-efficiency
-description: Agent rules for Azure Databricks efficiency (ingest fields in body, ceiling vs consumed vs utilized, VM series D E F, autoscale/topology; no peak CPU/memory samples; +20 planning buffer; 4 vCPU floor; minimal-worker rightsizing preference); output strict recommendation JSON schema_version 2.0.0.
+description: Agent rules for Azure Databricks efficiency (ingest fields in body; procedure order: VM family D/E/F first, worker/autoscale second, single-node last resort only; +20 planning buffer; 4 vCPU floor); output strict recommendation JSON schema_version 2.0.0.
 ---
 
 ### Agent directives (read first)
 
 **Scope constraint:** Azure Databricks on Azure VMs only.
 
-**Mandatory:** Apply **`Metric Interpretation Rules`**, then Steps **1 through 5 in order**. Emit **one recommendation JSON object** conforming **`Output Expectations`**. Tie every recommendation to ingest field values cited in **`analysis_summary.key_evidence`** or **`comparison.rationale`**.
+**Mandatory:** Apply **`Metric Interpretation Rules`**, then Steps **1 through 3 in order**. Emit **one recommendation JSON object** conforming **`Output Expectations`**. Tie every recommendation to ingest field values cited in **`analysis_summary.key_evidence`** or **`comparison.rationale`**.
 
-**Primary lens:** **CPU and memory utilization** (**Consumed vs Utilized** ratios, **`cluster_avg_*_pct_of_ceiling_capacity`** as supporting aggregates, worker **`p95`/`p99`** tails, CPU diagnostics). **Worker counts, autoscale min/max, and topology** align the **capacity shell** to that utilization story; they do **not** replace it.
+**Procedure order (non-negotiable):** **(1)** Decide **VM family** (**D** / **E** / **F**) and CPU-vs-memory fit from utilization **before** locking worker counts. **(2)** Recommend **worker/autoscale** (and ceiling alignment) for that family. **(3)** Consider **`single_node`** topology **only** as a **last resort** when **Step 3** bars are met **default** remains **`multi_node`**.
+
+**Primary lens:** **CPU and memory utilization** (**Consumed vs Utilized** ratios, **`cluster_avg_*_pct_of_ceiling_capacity`**, worker **`p95`/`p99`** tails, CPU diagnostics). **Step 1** interprets this lens for **family**; **Step 2** applies it to **how many workers** and **autoscaler bounds**.
 
 **Planning buffer (no peak samples):** For **CPU** and **memory** separately, compute **utilized percentage of allocated** (**0-100**) from **`avg_*_utilized_by_workload / avg_*_allocated_active_cluster`**. Treat **`min(100, observed_pct + 20)`** as the **minimum stress-planning level** for sizing and shrink decisions **do not** invent unstated spike headroom. Other margins require **`confidence_notes`**.
 
-**Minimal-worker rightsizing:** When **`avg_worker_nodes_consumed`** and **`p99_worker_nodes_consumed`** are both **`<= 1`** (bundled ingest rules apply) **and** both dimensions stay **persistently low** per **Core Optimization Principles**, **prefer** explicit **SKU / VM family** evaluation (**Step 4**) **do not** treat **autoscale ceiling-only** changes as a complete cost outcome without rationale on rightsizing.
+**Minimal workers + low utilization:** When **`avg_worker_nodes_consumed`** and **`p99_worker_nodes_consumed`** are both **`<= 1`** and ratios are persistently low, **complete Step 1 family/SKU reasoning** and **Step 2** worker/autoscale **do not** emit **autoscale-only** rationale without **Step 1** family conclusions.
 
-**Full procedure (no early exit):** **Always evaluate Steps 2, 3, and 4** when the ingest fields those steps require are present (otherwise document missing evidence in **`confidence_notes`** / **`INSUFFICIENT_EVIDENCE`**). **`OVERPROVISIONED_AUTOSCALE` or other Step 1 findings do not** waive Steps **2 through 5**. Never recommend **`recommended_configuration`** (SKU, **`min_workers`**/**`max_workers`**, **`cluster_topology`**) based **only** on Step 1; **`comparison.rationale`** and **`analysis_summary.key_evidence`** must reflect **allocated-vs-utilized CPU/memory** reasoning from Step **2** and, when **`recommended_configuration`** changes SKU / **`vm_family`** versus **`current_configuration`**, **VM family fit** from Step **4** (unless **`INSUFFICIENT_EVIDENCE`** states Step 4 inputs are missing).
+**Full procedure (no early exit):** **Always complete Steps 1, 2, and 3** when ingest allows (otherwise **`INSUFFICIENT_EVIDENCE`** / **`confidence_notes`**). **`comparison.rationale`** must cite **Step 1** family logic (when **`vm_family`** or SKU class changes or is defended) and **Step 2** worker/ceiling/utilization logic **before** any **`single_node`** recommendation (**Step 3**).
 
 **Historical summaries** (when the user attaches them explicitly: e.g. `copilot-results/history-summary.{md,json}`): use only as secondary context **after** interpreting current-run metrics; **never** substitute for absent primary metrics **and** never assume access to unmanaged files.
 
@@ -23,16 +25,17 @@ description: Agent rules for Azure Databricks efficiency (ingest fields in body,
 
 ## Core Optimization Principles
 
-Lead with **CPU and memory signals**: **Utilized versus allocated**, diagnostics (**`avg_cpu_*_pct`**, especially **`avg_cpu_wait_pct`**), worker **`p95`/`p99`** node tails, **`cluster_avg_*_pct_of_ceiling_capacity`**, plus **`workflow_task_count`**. Treat **autoscaler ceilings**, **worker percentiles**, and **topology** as **how capacity is shaped**, so Steps **2-4** conclusions stay consistent with measured utilization (**Step 1** alone is shell context).
+Lead with **CPU and memory signals** for **Step 1 family choice**, then **Step 2** worker/autoscale. **Single-node topology** is **not** a default path (**Step 3**, last resort only).
 
 ### 1. Minimum node size rule
 - **Never** recommend node types smaller than **4 vCPUs** per node (platform may still reserve a fraction of vCPU per node).
 
-### 2. Prefer reducing node count before shrinking node size
-- Order levers when idle: tighten **workers / autoscale** before smaller SKUs unless Step 2 already shows **allocated-vs-utilized** saturation.
-- **Minimal workers + persistently low utilization:** When **`avg_worker_nodes_consumed`** and **`p99_worker_nodes_consumed`** are both **`<= 1`** (see **Driver and worker ingest**) **and** **both** CPU and memory **utilized-to-allocated** percentages (**0-100** from the ratios) are **below ~40%** on window averages, **prefer** **SKU and VM family rightsizing** (**Step 4**) alongside or instead of **only** narrowing **`max_workers`**. **`comparison.rationale`** that **only** tightens autoscale **must justify** skipping rightsizing (**INSUFFICIENT_EVIDENCE**, pipeline lock, or documented risk in **`confidence_notes`**). Apply the **Planning buffer** (**Metric Interpretation Rules**) before claiming extra invisible headroom.
-- When node count is **already low** (for example, **`min_workers`** and actual consumption are at a practical floor, or further reduction would conflict with parallelism or headroom), treat **node-count reduction** as **exhausted** for this pass. Then prefer **rightsizing**: a **smaller SKU** within the **4 vCPU minimum** rule and/or a **better-fitting VM family** (see Step 4), **only when metrics** (**allocated vs utilized** ratios, **`cluster_avg_*_utilization_pct_of_ceiling_capacity`**, **`workflow_task_count`**, node percentiles) **show sustained headroom**. Document uncertainty in **`confidence_notes`** or impact fields rather than implying zero performance risk.
-- If the workload is very small and lightly parallelized, evaluate whether switching to a **single-node cluster topology** is justified (see Step 5).
+### 2. Lever order (family, then workers, single-node last)
+- **First (Step 1):** From **CPU vs memory** utilization shape (**allocated vs utilized**, **`cluster_avg_*_pct_of_ceiling_capacity`**, diagnostics, pipeline context), decide whether the workload is **memory-biased** (**E**), **compute-biased** (**F** per Step 1 rules), or **balanced** (**D**). Pick **target `vm_family`** / SKU class **before** finalizing worker counts.
+- **Second (Step 2):** Given that family, set **`min_workers`**/**`max_workers`**, align **`max_worker_nodes_cluster_ceiling`** story (**OVERPROVISIONED_AUTOSCALE**), consumed vs utilized (**PER_NODE_UNDERUTILIZED**), and **`workflow_task_count`** (**LOW_PARALLELISM**).
+- **Third (procedure):** **`single_node`** **only** using **Step 3** last-resort criteria (**below**) **otherwise** **`multi_node`**. **Do not** recommend single-node because the job is “small” alone.
+- **Minimal workers + persistently low utilization:** When **`avg`**/**`p99`** workers **`<= 1`** **and** CPU and memory utilized-to-allocated **both below ~40%**, **Step 1** must still justify **D/E/F** and SKU size **Step 2** must not be **only** autoscale tightening without **Step 1** addressed. Apply the **Planning buffer** before claiming spare capacity.
+- When node count is **already at a practical floor**, prefer **smaller SKU within the 4 vCPU floor** and correct **family** over pushing single-node for cost.
 - Do not recommend shrinking below **4 vCPUs** per node.
 
 ### 3. Evidence binding
@@ -55,15 +58,15 @@ Assume **exactly these field names** in a flat JSON blob (omit keys when unknown
 **Current ingest (bundled telemetry):**
 
 - **`azure_worker_vm_size`** describes the **same Azure VM SKU** used for **both** the driver and the workers (**one** worker-type string applies to driver + executor nodes for this ingest).
-- **Node-count and cluster capacity fields bundle the driver**: **`max_worker_nodes_cluster_ceiling`**, **`avg_worker_nodes_consumed`**, **`p95_worker_nodes_consumed`**, **`p99_worker_nodes_consumed`**, **`total_vcpus_cluster_ceiling`**, **`total_memory_gb_cluster_ceiling`**, **`avg_vcpus_allocated_active_cluster`**, and **`avg_memory_gb_allocated_active_cluster`** are **aggregated totals that include the driver** with workers (upstream definition). Interpret **Ceiling**, **Consumed** node tails, and **Consumed** compute/RAM in Step 1 vs Step 2 **on that bundled basis**, **not** as workers-only.
-- When **`max_worker_nodes_cluster_ceiling` equals `1`**, treat as **single-node** posture for **this ingest** (capacity story matches one colocated footprint). **Classic** **`min_workers`/`max_workers` = `1`** is **still not** sufficient alone for **true single-node** topology (Step 5) when ingest is bundled.
+- **Node-count and cluster capacity fields bundle the driver**: **`max_worker_nodes_cluster_ceiling`**, **`avg_worker_nodes_consumed`**, **`p95_worker_nodes_consumed`**, **`p99_worker_nodes_consumed`**, **`total_vcpus_cluster_ceiling`**, **`total_memory_gb_cluster_ceiling`**, **`avg_vcpus_allocated_active_cluster`**, and **`avg_memory_gb_allocated_active_cluster`** are **aggregated totals that include the driver** with workers (upstream definition). Interpret **Ceiling**, **Consumed** node tails, and **Consumed** compute/RAM in **Step 2** **on that bundled basis**, **not** as workers-only.
+- When **`max_worker_nodes_cluster_ceiling` equals `1`**, treat as **single-node** posture for **this ingest** (capacity story matches one colocated footprint). **Classic** **`min_workers`/`max_workers` = `1`** is **still not** sufficient alone for **true single-node** topology (**Step 3**) when ingest is bundled.
 
 **Future ingest (split driver vs worker):**
 
-- When **`null`/missing**, keep **bundled rules** above. When **new driver-scoped and worker-scoped fields** arrive in the ingest (names will be appended to **`Metric Interpretation Rules`**), **prioritize worker-scoped** ceilings, consumed node counts, and allocated worker vCPU/memory for **Step 1-3** worker-pool/autoscale conclusions **prioritize driver-scoped** SKU and aggregates for **driver sizing** narratives and imbalance between driver vs workers. **Do not** use bundled cluster aggregates for worker-only slack if split fields supersede them for the same notion.
+- When **`null`/missing**, keep **bundled rules** above. When **new driver-scoped and worker-scoped fields** arrive in the ingest (names will be appended to **`Metric Interpretation Rules`**), **prioritize worker-scoped** ceilings, consumed node counts, and allocated worker vCPU/memory for **Step 2** worker-pool/autoscale conclusions **prioritize driver-scoped** SKU and aggregates for **driver sizing** narratives and imbalance between driver vs workers. **Do not** use bundled cluster aggregates for worker-only slack if split fields supersede them for the same notion.
 - If bundled and split fields **both appear** temporarily, prefer **split** fields for contradictory concepts and note overlap in **`confidence_notes`**.
 
-**Three capacity layers (tie Steps 1-2)**
+**Three capacity layers (tie Step 2)**
 
 - **Ceiling:** configured autoscaler/policy **max** (see **bundled** vs split rules above). **Fields:** `max_worker_nodes_cluster_ceiling`, `total_vcpus_cluster_ceiling`, `total_memory_gb_cluster_ceiling`
 - **Consumed:** allocation over the window: node **avg** + percentiles and **cluster** allocated vCPU/RAM (**bundled ingest** counts driver with workers **not** workers-only). **Fields:** `avg_worker_nodes_consumed`, `p95_worker_nodes_consumed`, `p99_worker_nodes_consumed`, `avg_vcpus_allocated_active_cluster`, `avg_memory_gb_allocated_active_cluster`
@@ -93,7 +96,7 @@ Else **`INSUFFICIENT_EVIDENCE`** / skip ratio; never fabricate divisors.
 - **`azure_worker_vm_size`:** Azure VM SKU for **drivers and workers** (**same SKU** until split ingest exposes a driver SKU separately).
 - **`max_worker_nodes_cluster_ceiling`:** Bundled ingest: ceiling **includes driver** with workers (not workers-only); value **`1`** matches **single-node** ingest posture (**Driver and worker ingest**).
 - **`total_vcpus_cluster_ceiling`**, **`total_memory_gb_cluster_ceiling`:** Bundled: **cluster** vCPU/memory **ceiling includes driver**.
-- **`avg_worker_nodes_consumed`**, **`p95_worker_nodes_consumed`**, **`p99_worker_nodes_consumed`:** Bundled: node-count shape **includes driver** (**Consumed** tails for Step 1).
+- **`avg_worker_nodes_consumed`**, **`p95_worker_nodes_consumed`**, **`p99_worker_nodes_consumed`:** Bundled: node-count shape **includes driver** (**Consumed** tails for Step 2).
 - **`avg_vcpus_allocated_active_cluster`**, **`avg_memory_gb_allocated_active_cluster`:** Bundled: **allocated** totals **include driver RAM/vCPU denominator** (**Consumed**).
 - **`avg_vcpus_utilized_by_workload`**, **`avg_memory_gb_utilized_by_workload`:** Workload-attributed use inside that shell (**Utilized**).
 - **`cluster_avg_cpu_utilization_pct_of_ceiling_capacity`**, **`cluster_avg_memory_utilization_pct_of_ceiling_capacity`:** Cluster aggregates versus ceiling (0-100); use with ratios above, never as a substitute for **Utilized**/allocated splits.
@@ -124,53 +127,18 @@ Use only to validate, not drive decisions:
 
 ## Required Analysis Procedure
 
-Follow this sequence **to completion**. Do **not** stop after Step 1.
+Follow **Steps 1, 2, then 3**. **Default `multi_node`.** Complete **Step 1** before treating worker/autoscale numbers as final.
 
-### Step 1: Cluster ceiling vs consumed (autoscaler bounds)
+### Step 1: VM family and SKU class (D / E / F) — **first**
 
-**Role:** Bounds the **capacity shell** (autoscaler/policy **max**, worker tails) so CPU/memory ratios in Steps **2-4** are read **in cluster context**. **Shell slack** is **not** the optimization target by itself.
+**Role:** Compare **CPU vs memory** utilization and pipeline bias **first** pick **E** (memory-biased), **F** (compute-biased, gated), or **D** (balanced) **before** locking worker counts.
 
-Compare **`max_worker_nodes_cluster_ceiling`** and **`total_vcpus_cluster_ceiling`** / **`total_memory_gb_cluster_ceiling`** versus **`avg_worker_nodes_consumed`**, **`p95_worker_nodes_consumed`**, **`p99_worker_nodes_consumed`**.
+**Inputs:** **`avg_vcpus_utilized_by_workload / avg_vcpus_allocated_active_cluster`** and **`avg_memory_gb_utilized_by_workload / avg_memory_gb_allocated_active_cluster`** (express as **0-100** utilized-% of allocated **apply Planning buffer** per dimension), **`cluster_avg_*_pct_of_ceiling_capacity`**, **`avg_cpu_user_pct`**, **`avg_cpu_system_pct`**, **`avg_cpu_wait_pct`**, optional **`processed_*`**, **`workflow_task_count`** as orchestration context (**not** Spark executor parallelism).
 
-If sustained gap shows **configured max materially above distributional need**, use **`OVERPROVISIONED_AUTOSCALE`**. In rationale: anchor on **burst headroom tolerance** (**not** unspent DBU unless user states committed capacity). **`OVERPROVISIONED_AUTOSCALE`** still requires **explicit Step 2 (and Steps 3-4 where applicable)** before final **`recommended_configuration`** (autoscale knobs, SKU, **`cluster_topology`**). **Step 2** must justify **whether** tightening workers is safe given **allocated-vs-utilized** CPU/memory (no peak utilization samples in ingest). **Step 4** applies when **`recommended_configuration`** changes SKU or **`vm_family`** versus **`current_configuration`**, unless **`INSUFFICIENT_EVIDENCE`** states Step 4 inputs are missing. When **Core Optimization Principles** **minimal-worker rightsizing** policy applies, **`comparison.rationale`** cannot rely on **`max_workers`** ceiling tightening **alone** **without** addressing **Step 4** SKU/family fit **unless** it documents why rightsizing is skipped.
-
-### Step 2: Consumed (`allocated`) vs utilized (**mandatory** before final sizing)
-
-**Role:** Grounds cost and saturation in **workload CPU and memory** versus what the cluster actually held (**Consumed** allocation). Pair with Step 4 for SKU/family conclusions.
-
-Apply SKU / series / **`PER_NODE_UNDERUTILIZED`** against shells that actually ran (**consumed allocation**):
-
-- Ratio **`avg_vcpus_utilized_by_workload / avg_vcpus_allocated_active_cluster`**
-- Ratio **`avg_memory_gb_utilized_by_workload / avg_memory_gb_allocated_active_cluster`**
-- Triangulate with **`p95_worker_nodes_consumed`** / **`p99_worker_nodes_consumed`** and **`cluster_avg_*_pct_of_ceiling_capacity`** before aggressive shrink. Apply the **Planning buffer** to **utilized percent of allocated** (CPU and memory separately). **Without** peak utilization samples in ingest, prefer conservative deltas **or** explain residual uncertainty in **`confidence_notes`**.
-
-Low **utilized/allocated** ratio **when worker tails and vs-ceiling aggregates do not contradict aggressive shrink**, use **`PER_NODE_UNDERUTILIZED`**. Still cite **`cluster_avg_*_pct_of_ceiling_capacity`** separately; orthogonal denominator.
-
-### Step 3: Workflow orchestration parallelism
-
-**Role:** Explains whether **scaled-out workers** materially shorten the job or mainly add idle capacity (parallelism context for Steps **1-2** levers).
-
-**`workflow_task_count`** means Databricks workflow **tasks** (**not Spark executor parallelism**).
-
-Decide **`LOW_PARALLELISM`** from:
-- Whether multiple job tasks run concurrently or strictly sequentially
-- Whether individual tasks are lightweight orchestration steps versus heavy Spark compute
-- Whether scaling **additional** workers meaningfully **reduces** end-to-end runtime or **merely increases** idle capacity
-
-If the workflow consists of few tasks, runs primarily sequentially, or each task underutilizes available cores, treat parallelism benefit as limited and flag:
-- `LOW_PARALLELISM`
-
-### Step 4: Azure VM series (CPU vs RAM skew)
-
-**Role:** Turns **CPU and memory utilization shape** (**allocated vs utilized**, wait%) into **`vm_family` / SKU series** (**D**, **E**, **F**) and **`VM_FAMILY_MISMATCH`**. Evaluate **every** pass when SKU/family-change is on the table; default **keep current family** with explicit reasoning if ratios are balanced.
-
-Inputs: ratios **allocated versus utilized**, **`cluster_avg_*_pct_of_ceiling_capacity`**, diagnostics **`avg_cpu_user_pct|system_pct|wait_pct`**.
-
-- **GiB-heavy:** elevated memory ratio / shuffle-cache narrative; take an **E** stance; mismatched **D|F** with stress, use **`VM_FAMILY_MISMATCH`** toward **memory-rightsizing**/**E**.
-- **CPU-heavy + memory slack:** conversely consider **F** **only if** **`avg_cpu_wait_pct`** excludes pure I/O-wait pathology; otherwise prefer **E-to-D** bias first.
-- **Balanced:** default to **D**. **`processed_*`** optional weight only.
-
-Runs **after** Steps 1-3; obey **Core Optimization Principles section 2** ordering before series churn.
+**Family decision:**
+- **GiB-heavy:** elevated memory ratio / **`cluster_avg_memory_*`** / shuffle-cache narrative **prefer **E** ** **`VM_FAMILY_MISMATCH`** when the current series mismatches memory pressure.
+- **CPU-heavy + memory slack:** consider **F** **only if** **`avg_cpu_wait_pct`** excludes pure I/O-wait pathology **otherwise** prefer **E-to-D** bias before **F**.
+- **Balanced CPU and memory:** default **D**.
 
 **E-series:**
 - Prefer when memory pressure dominates: high **`avg_memory_gb_utilized_by_workload` / `avg_memory_gb_allocated_active_cluster`**, high **`cluster_avg_memory_utilization_pct_of_ceiling_capacity`**, or shuffle/broadcast/cache behavior.
@@ -185,24 +153,34 @@ Runs **after** Steps 1-3; obey **Core Optimization Principles section 2** orderi
 
 **Always** assign **`VM_FAMILY_MISMATCH`** whenever fit skews (**no F-only supplemental code** unless external program extends enumerations).
 
-### Step 5: Single-node topology (**true** driver+executor VM)
+### Step 2: Workers, autoscale, ceiling vs consumed, and parallelism
 
-**`single-node` here** means **Databricks single-node topology** (**one VM** colocates driver **and** workloads). **`autoscale.min==max==1`** on classic often **still means driver+worker (2-node)**; that signal alone is insufficient.
+**Role:** After Step **1** target family, recommend **driver + worker pool shape**: **`min_workers`**/**`max_workers`**, ceiling alignment, utilization codes, orchestration.
 
-**Bundled ingest:** **`p95`/`p99`/`avg` node counts** below follow **Driver and worker ingest** (**driver included**). When split worker-only metrics exist, use those for worker tail shapes instead.
+**2A Cluster ceiling vs consumed:** Compare **`max_worker_nodes_cluster_ceiling`**, **`total_vcpus_cluster_ceiling`**, **`total_memory_gb_cluster_ceiling`** to **`avg_worker_nodes_consumed`**, **`p95_worker_nodes_consumed`**, **`p99_worker_nodes_consumed`**. If **configured max materially above** distributional need, **`OVERPROVISIONED_AUTOSCALE`**. Rationale: **burst headroom tolerance** (**not** unspent DBU unless committed-capacity story). Tie **`max_workers`** recommendations to **Step 1** family.
 
-Eligible pattern examples:
-- **`p95_worker_nodes_consumed`** or **`p99_worker_nodes_consumed`** is less than or equal to **2**
-- **`avg_vcpus_utilized_by_workload` / `avg_vcpus_allocated_active_cluster`** (and memory analog) indicate very low utilization of actively allocated worker capacity
-- **`workflow_task_count`** plus orchestration semantics suggest minimal parallel gain
+**2B Consumed vs utilized:** Ratios **`avg_vcpus_utilized_by_workload / avg_vcpus_allocated_active_cluster`** and memory analog **triangulate** **`p95`/`p99`** worker nodes and **`cluster_avg_*_pct_of_ceiling_capacity`**. Apply **Planning buffer**. **`PER_NODE_UNDERUTILIZED`** when utilized/allocated is low **and** tails do not contradict shrink. Cite **`cluster_avg_*_pct_of_ceiling_capacity`** separately.
 
-If eligible, flag:
-- `SINGLE_NODE_ELIGIBLE`
+**2C Workflow orchestration parallelism:** **`workflow_task_count`** **means** job workflow **tasks**. **`LOW_PARALLELISM`** when extra workers **do not** materially shorten wall-clock.
 
-If you recommend switching to a **single-node cluster topology** for the next configuration, also flag:
-- `SINGLE_NODE_RECOMMENDED`
+**Mandatory:** **`comparison.rationale`** reflects **Step 1** **and** **Step 2** before **`single_node`**. Autoscale-only outcomes **must not** skip **Step 1** family reasoning (**Core Optimization Principles**).
 
-If single-node is recommended, emit JSON **`cluster_topology:"single_node"`** and **`comparison.single_node.recommended:true`** (**Output Expectations**).
+### Step 3: Single-node topology (**last resort only**)
+
+**Default:** **`multi_node`**. **Do not** treat single-node as a routine optimization.
+
+**Definition:** **True single-node** = **one Azure VM** runs **driver and executors** together **not** classic driver VM + worker VM.
+
+Recommend **`cluster_topology":"single_node"`** **only if all** hold **otherwise** **`multi_node`**:
+1. **Steps 1 and 2** complete with defensible **`vm_family`**/**SKU** and worker/autoscale story **with** no **`INSUFFICIENT_EVIDENCE`** blockers for sizing.
+2. **`workflow_task_count`** + semantics show **no meaningful parallel gain** from scaling workers out for this pipeline.
+3. **`p99_worker_nodes_consumed`** (bundled ingest **includes driver**) is consistent with a **narrow** footprint **and** **Planning buffer** fits **one** VM at the **Step 1** SKU class.
+4. **`comparison.rationale`** explains why **multi-node** is **unnecessary cost or complexity** **not** only "low utilization."
+5. **`autoscale.min==max==1`** on classic **does not** prove single-node (often **still driver + worker**).
+
+**Reason codes:** **`SINGLE_NODE_ELIGIBLE`** and **`SINGLE_NODE_RECOMMENDED`** are **rare** **only** when (1)-(5) are clearly satisfied **if uncertain**, keep **`multi_node`** and explain in **`confidence_notes`**.
+
+Emit **`comparison.single_node.recommended:true`** only when recommending **`single_node`** (**Output Expectations**).
 
 ---
 
@@ -210,8 +188,8 @@ If single-node is recommended, emit JSON **`cluster_topology:"single_node"`** an
 
 ### VM Sizing
 - Maintain a minimum of **4 vCPUs per node**.
-- Prefer reducing node count before recommending different node sizes (Core Optimization Principles section 2, including rightsizing SKU or family when count is already low).
-- Apply **Step 4** when choosing or changing **Azure D / E / F** series so CPU versus GiB utilization skew stays consistent.
+- Follow **Core Optimization Principles section 2**: **Step 1** family fit **then** **Step 2** worker counts **then** **Step 3** single-node only if warranted.
+- Apply **Step 1** when choosing or changing **Azure D / E / F** series so CPU versus GiB utilization skew stays consistent **before** finalizing autoscale.
 - If changing family or SKU, ensure proposed memory is sufficient for observed workload behavior, **`cluster_avg_*_pct_of_ceiling_capacity`** story, and shuffle/broadcast/cache risk.
 
 ### Single-node memory rule
@@ -261,8 +239,8 @@ Must enforce mapping:
 - `PER_NODE_UNDERUTILIZED`
 - `VM_FAMILY_MISMATCH`
 - `LOW_PARALLELISM`
-- `SINGLE_NODE_ELIGIBLE`
-- `SINGLE_NODE_RECOMMENDED`
+- `SINGLE_NODE_ELIGIBLE` (only if **Step 3** bars are clearly met **rare**)
+- `SINGLE_NODE_RECOMMENDED` (only if **Step 3** bars are clearly met **rare**)
 - `NO_CHANGE_RECOMMENDED`
 - `INSUFFICIENT_EVIDENCE`
 
@@ -280,7 +258,7 @@ Respond **exactly once** as **strict JSON**. Schema = below contract + verbatim 
 
 **MUST NOT:** spawn parallel recommendation trees outside **`comparison`**; invent ingest stats.
 
-**Enums:** **`cluster_topology`** must be the string **`multi_node`** or **`single_node`** (per Step 5 definition).
+**Enums:** **`cluster_topology`** must be the string **`multi_node`** or **`single_node`** (default **`multi_node`** **Step 3** single-node rules).
 
 ```json
 {
