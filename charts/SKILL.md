@@ -46,6 +46,17 @@ Historical summaries (if user attaches them): **secondary only** **never** repla
 - **Planning buffer** (no peaks): per CPU and memory, **`utilized_pct_of_allocated = ratio * 100`**, plan using **`min(100, utilized_pct + 20)`** unless **`confidence_notes`** override.
 - **Bundled telemetry:** **`azure_worker_vm_size`** applies to **driver and workers**. Node-count and **`avg_*_allocated_active_cluster`** fields **include the driver** **not** workers-only splits. **`max_worker_nodes_cluster_ceiling` = `1`** = single-node **ingest posture** classic **`min=max=1`** alone **not** true single-node.
 
+### Databricks availability enforcement (required)
+
+- **Recommend only Databricks-available node types:** **`comparison.recommended_configuration.azure_node_type`** must exist in **`system.compute.node_types`** for the target workspace/region (or equivalent user-provided export of that table).
+- **Allow-list gate (in addition to system table):** Recommended node type must be in this allow-list:
+  - **D-Series:** `Standard_D2ds_v6`, `Standard_D12_v2`, `Standard_D3_v2`, `Standard_D4s_v5`, `Standard_D4ds_v6`, `Standard_D4as_v5`, `Standard_D4ds_v5`, `Standard_D8as_v5`, `Standard_D13_v2`, `Standard_D8s_v5`, `Standard_D8ds_v5`, `Standard_D8ds_v6`, `Standard_D4_v2`, `Standard_D5_v2`, `Standard_D16s_v5`, `Standard_D14_v2`, `Standard_D16as_v5`, `Standard_D16ds_v6`, `Standard_D16ds_v5`
+  - **E-Series:** `Standard_E2ds_v6`, `Standard_E4ds_v5`, `Standard_E4ds_v6`, `Standard_E4as_v5`, `Standard_E4s_v5`, `Standard_E8ds_v5`, `Standard_E8as_v5`, `Standard_E8s_v5`, `Standard_E8ds_v6`, `Standard_E16s_v5`, `Standard_E16ds_v5`, `Standard_E16as_v5`, `Standard_E16ds_v6`
+  - **F-Series:** `Standard_F4s_v2`, `Standard_F4s`, `Standard_F4`, `Standard_F8s_v2`, `Standard_F8s`, `Standard_F8`, `Standard_F16s`, `Standard_F16`, `Standard_F16s_v2`
+- **Dual filter behavior:** If a SKU is on allow-list but missing in **`system.compute.node_types`**, **do not recommend it**. If a SKU is in system table but not in allow-list, **do not recommend it**.
+- **Fallback behavior:** If preferred SKU is filtered out, pick the next closest SKU that passes both gates and explain in **`recommended_configuration.notes`** and/or **`confidence_notes`**.
+- **No availability evidence case:** If no workspace-specific **`system.compute.node_types`** evidence is provided, avoid changing to an unverified SKU. Prefer keeping current node type with **`INSUFFICIENT_EVIDENCE`** or explicitly note uncertainty in **`confidence_notes`**.
+
 ---
 
 ### Ingest field names
