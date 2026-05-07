@@ -19,8 +19,9 @@ Use the **databricks-efficiency** skill for **cost and configuration fit** from 
  * Treat **current run metrics** as the primary source of truth.
  * Use historical summaries only if explicitly provided.
  * Follow **Procedure** in the skill (family/SKU first) **do not** defer **D/E/F** or SKU sizing when metrics support a better fit.
- * For same-family equivalent capacity options, prefer newer generation first, then local-temp-disk variants (for example **`*ds_v*`**) over no-local-disk variants **when both exist**; otherwise document why local-temp-disk is unavailable or unnecessary.
+ * On **eligible** SKUs at the same vCPU/mem tier prefer **`Standard_*ads_v*`** before **`Standard_*ds_v*`**. If **`ads`** is unavailable, pick the lowest-cost SKU that satisfies fit and explain in notes prefer local-temp over no-disk when a pairing exists.
  * Enforce Databricks availability first: recommended `azure_node_type` must come from (allow-list ∩ workspace/region `system.compute.node_types`). Apply generation/local-temp preferences only after this eligibility filter and only as ranking tie-breakers.
+ * Include workspace/region `system.compute.node_types` evidence in the input whenever possible. If missing, avoid unverified SKU changes and use `INSUFFICIENT_EVIDENCE` with notes.
  * Do not infer single-node topology from autoscale settings alone.
  * Interpret **`workflow_task_count`**, **allocated-vs-utilized** fields, percentages (`_pct`), and percentiles (`p95_` / `p99_`) **only** as defined in **databricks-efficiency** (input uses the flat ingest names from that skill; no ingest version field expected).
  * Do not assume prompts create files or directories; engineers manually save generated JSON under `copilot-results/` per repo conventions.
