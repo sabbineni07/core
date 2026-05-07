@@ -54,8 +54,15 @@ Historical summaries (if user attaches them): **secondary only** **never** repla
   - **E-Series:** `Standard_E2ds_v6`, `Standard_E4ds_v5`, `Standard_E4ds_v6`, `Standard_E4as_v5`, `Standard_E4s_v5`, `Standard_E8ds_v5`, `Standard_E8as_v5`, `Standard_E8s_v5`, `Standard_E8ds_v6`, `Standard_E16s_v5`, `Standard_E16ds_v5`, `Standard_E16as_v5`, `Standard_E16ds_v6`
   - **F-Series:** `Standard_F4s_v2`, `Standard_F4s`, `Standard_F4`, `Standard_F8s_v2`, `Standard_F8s`, `Standard_F8`, `Standard_F16s`, `Standard_F16`, `Standard_F16s_v2`
 - **Dual filter behavior:** If a SKU is on allow-list but missing in **`system.compute.node_types`**, **do not recommend it**. If a SKU is in system table but not in allow-list, **do not recommend it**.
+- **Closed set:** Treat the allow-list as a strict closed set. **Never** output a recommended node type outside these exact values.
 - **Fallback behavior:** If preferred SKU is filtered out, pick the next closest SKU that passes both gates and explain in **`recommended_configuration.notes`** and/or **`confidence_notes`**.
 - **No availability evidence case:** If no workspace-specific **`system.compute.node_types`** evidence is provided, avoid changing to an unverified SKU. Prefer keeping current node type with **`INSUFFICIENT_EVIDENCE`** or explicitly note uncertainty in **`confidence_notes`**.
+- **Deterministic selection order (must follow):**
+  1. Build eligible candidates using strict intersection (**allow-list** ∩ **`system.compute.node_types`**).
+  2. Restrict to chosen **`vm_family`** and required capacity envelope (CPU/memory fit from metrics).
+  3. Rank eligible candidates by: closest fit, then newer generation, then local-temp-disk preference (when applicable), then lowest cost-risk.
+  4. Emit only the top ranked value from that eligible set.
+- **Preference safety rule:** Version/local-disk preferences are tie-breakers **after** eligibility filtering; they must never synthesize or mutate SKU names.
 
 ---
 
