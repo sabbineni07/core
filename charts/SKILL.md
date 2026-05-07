@@ -13,7 +13,7 @@ description: Azure Databricks cost-aware cluster optimization; ingest metrics in
 
 **Azure size-pair preference (explicit):** For the same family and capacity intent, prefer **`*ds_v*`** (or equivalent local-temp-disk variant such as `*ads_v*` / `*pdsv*` where naming applies) over **`*s_v*`** (for example **`Standard_D4ds_v5`** over **`Standard_D4s_v5`**). Treat recommending the no-local-temp variant when a viable local-temp variant exists as an exception path: explain the blocker in **`recommended_configuration.notes`** and/or **`confidence_notes`** (policy/region availability, workload incompatibility, measured risk, or stronger metric-backed cost/perf reason).
 
-**AMD `ads` vs Intel `ds` (same capacity tier):** When **eligible** candidates include **`Standard_*ads_v*`** and **`Standard_*ds_v*`** with the **same** nominal **`vcpus_per_node`** and **`memory_gb_per_node`** (for example **`Standard_D2ads_v6`** vs **`Standard_D2ds_v6`**), rank **`ads`** **above** **`ds`** (often lower hourly list price verify with org/table if attached). When **`ads`** is **not** in **`eligible_node_types`**, pick the **least expensive** intersection SKU that satisfies the buffered CPU/memory envelope and note the substitution.
+**AMD `ads` vs Intel `ds` (same D/E band):** After **`eligible_node_types`** is built, rank **`ads`** above **`ds`** whenever both sit in the **same size band + `_vN`** per **Eligible-SKU naming order** (**works for every D/E size step on your allow-list**). **Never** mint SKU strings to fabricate an “`ads` sibling.”
 
 **Feature-2 availability guardrail:** Do **not** assume every D/E/F subfamily has a Feature-2 (local temp disk) sibling. Some subfamilies are intentionally no-local-disk and documented as better value when local temp storage is not required. In those cases, prefer **newest generation within the available subfamily**, and document that local-temp-disk was unavailable or not required.
 
@@ -37,17 +37,25 @@ Historical summaries (if user attaches them): **secondary only** **never** repla
 
 1. **Family / SKU (`vm_family` D / E / F):** From **CPU vs memory** utilization (**allocated vs utilized**, **`cluster_avg_*_pct_of_ceiling_capacity`**, **`avg_cpu_*`**, **`avg_cpu_wait_pct`**, **`workflow_task_count`** context), infer memory-heavy (**E**), compute-heavy vs balanced (**F** vs **D**). Emit **`VM_FAMILY_MISMATCH`** when current family does not fit **use metrics + normal Spark/Azure reasoning**. Recommended **`azure_node_type`** must always be copied **verbatim** from **`allow_list ∩ system.compute.node_types`** **never** inferred by swapping **`_v5`/`_v6`** or **`ads`/`ds`**.
 
-### Eligible-SKU naming order (same capacity class, plain English)
+### Eligible-SKU naming order (D/E size band + priorities)
 
-**Eligible** means the string appears in **both** the skill allow-list **and** `system.compute.node_types`. **Same capacity class** means same nominal **vCPU + RAM** for the SKU (same “size ladder” step, same generation suffix `_v*`).
+**Eligible** means the string appears in **both** the skill allow-list **and** `system.compute.node_types`.
 
-Among **eligible** SKUs only, after filtering by metrics fit:
+**D/E size band (generic applies to **all** nominal D/E size steps on the allow-list, e.g. **2**, **4**, **8**, **16** vCPU tiers):** Within one band only: **`ads` → `ds` → diskless `s`** (covers **`Standard_D4ads_v6`** vs **`Standard_D4ds_v6`**, **`Standard_D8ads_v6`** vs **`Standard_D8ds_v6`**, **`Standard_E8ads_v6`** vs **`Standard_E8ds_v6`**, and any **`D*`**/**`E*`** pair the **same way**):
+
+- **Preferred:** Use **`num_cpus`** and memory (**or equivalent**) from each SKU row in **`system.compute.node_types`**; two names share a band when they denote the **same published VM size**.
+- **Fallback when row columns are unavailable:** Parse **`Standard_`** plus **`D`** or **`E`**, then the **first contiguous size digit block** (**`Standard_D2...`**, **`Standard_D4...`**, **`Standard_D8...`**, **`Standard_D16...`**, ...), then terminal **`_vN`**. Matching (**`D`/`E`**, **digits**, **`_vN`**) ⇒ **same band**. **Never** compare across different digit blocks or different **`_vN`** inside the **`ads`/`ds`/`s`** ladder.
+- **Ambiguous naming (`ids`, `ibs`, non-`ads`/`ds` spellings):** Use **`system.compute.node_types`** vCPU/mem fields to bucket with peers if string parsing fails else record uncertainty in **`confidence_notes`** (**do not** guess a band).
+
+**`_vN` before flavor:** Apply **step (b)** in **Deterministic selection order** (highest generation among **literal** candidates) **before** **`ads`/`ds`/`s`** inside a band (example: **`Standard_D4ads_v6`** is **not** in the same **`ads`/`ds`/`s`** group as **`Standard_D4s_v5`** unless both share the **`_vN`** you are ranking for).
+
+**F-family:** The **`ads`/`ds`/`s`** ladder is for **D/E Azure name patterns** only - use **eligible** intersection plus **fit** for **F**.
 
 | Priority | Meaning |
 | --- | --- |
-| **Higher generation first** | Prefer the **newest `_v*` generation actually present** in `eligible_node_types` (example: **`Standard_D2ads_v6`**, not an invented **`Standard_D2ads_v5`**). |
-| **`ads` before `ds`** | AMD + local disk (**`Standard_*ads_v*`**), before Intel + local disk (**`Standard_*ds_v*`**), **at the same vCPU/mem and `_v*` generation**. |
-| **`ds` before `s` (diskless)** | Local-temp SKU (name includes **`ads`** or **`ds`**), before no-local-disk **`Standard_*s_v*`** style SKUs **when both are eligible** at the same size intent and generation. |
+| **Higher generation first** | Among **`eligible_node_types`**, prefer the **highest `_vN` suffix that appears on a candidate string** (**v7** > **v6** > **v5**). **Never** output a SKU unless that **exact** string is in **`eligible_node_types`** (do not “swap” generations or fabricate `ads`/`ds`). |
+| **`ads` before `ds`** | At the **same** D/E **size band** **and** **same `_vN`**, prefer **`...ads...`** (AMD + local temp) before **`...ds...`** (Intel + local temp). |
+| **`ads`/`ds` before diskless `s`** | At the **same** size band **and** **same `_vN`**, prefer a local-temp name (**contains `ads` or `ds` in the usual Azure pattern**) before a **no-local-disk** **`Standard_*s_v*`-style** SKU when both are eligible. |
 
 2. **Workers and autoscaler:** **`min_workers`**/**`max_workers`**, **`max_worker_nodes_cluster_ceiling`** vs consumed tails (**`OVERPROVISIONED_AUTOSCALE`**), low utilized vs allocated (**`PER_NODE_UNDERUTILIZED`**), orchestration (**`LOW_PARALLELISM`**).
 3. **`single_node` topology:** **Last resort only.** **Default `multi_node`.** Recommend **`single_node`** **only** when true single-VM (driver+executors colocated) is clearly appropriate **do not** infer from **`autoscale` min=max=1** alone. **`SINGLE_NODE_*`** codes should be **rare.**
@@ -75,14 +83,13 @@ Among **eligible** SKUs only, after filtering by metrics fit:
 - **Deterministic selection order (must follow):**
   1. Build eligible candidates using strict intersection (**allow-list** ∩ **`system.compute.node_types`**).
   2. Restrict to chosen **`vm_family`** and required capacity envelope (CPU/memory fit from metrics + planning buffer).
-  3. Rank eligible candidates by: (**a**) **closest fit** (minimal overshoot of required vCPU/mem after planning buffer); (**b**) **highest generation suffix `_v*` among candidate strings only** (**v7** beats **v6** beats **v5** parse from SKU text **never** assume `_v*` or swap suffixes unless literal in **`eligible_node_types`**); (**c**) **same `_v*` and same nominal vCPU/mem:** prefer **`Standard_*ads*`** before **`Standard_*ds*`** (**AMD** local-temp before **Intel** local-temp); (**d**) **same `_v*` and size intent:** prefer SKU names that include **`ads`** or **`ds`** before no-local **`Standard_*s_v*`** when eligible; (**e**) if **`ads`** is absent among fits, lowest hourly cost SKU that satisfies (**a**) when pricing/column evidence is supplied else remain with (**a**)(**c**)(**d**)).
+  3. Rank eligible candidates by: (**a**) **closest fit** (minimal overshoot of required vCPU/mem after planning buffer); (**b**) if the SKU string includes **`_vN`**, prefer higher **`N`** among **literal** candidates (**v7** > **v6** > **v5**); (**c**)(**d**) **only when `vm_family` is `D` or `E`:** within the same **D/E size band** (see **Eligible-SKU naming order**) and same **`_vN`**, prefer **`ads`** before **`ds`**, then local-temp (**`ads`**/**`ds`**) before diskless **`s_v`** when eligible; **when `vm_family` is `F`:** **skip (c)(d)** use (**a**)(**b)** and optional (**e**) only (**F** SKUs do not follow the D/E **`ads`/`ds`/`s`** ladder); (**e)** lowest hourly cost when pricing fields exist to break ties (including **F** and **D/E** after (**c**)(**d**)).
   4. Emit only the top ranked value from that eligible set.
-- **Preference safety rule:** Version (**`_v*`**), **`ads`/`ds`/`s`**, and Feature-2 (local disk) preferences apply **only** by ranking **literal** SKU strings already in **`eligible_node_types`** **never synthesize or mutate SKU names**.
-- **No invented generations:** Sizes like **`Standard_D2ads_v5`** may **not** exist for D-series even if **`Standard_D2ads_v6`** does **do not** output a SKU string unless it appears **exactly** in **`eligible_node_types`** (see allow-list ∩ system table intersection).
+- **No composed SKUs:** Every character of **`azure_node_type`** must match an **allow-list** entry **and** **`system.compute.node_types`** **do not** construct names by mixing generation (`_v5`/`_v6`) or feature letters (`ads`/`ds`/`s`) from different examples.
 - **Mandatory final validity check (before emitting JSON):**
   - Compute `eligible_node_types = allow_list ∩ system.compute.node_types`.
   - Verify `comparison.recommended_configuration.azure_node_type` is an **exact string match** in `eligible_node_types`.
-  - If check fails, **do not emit** the invalid SKU. Re-select from `eligible_node_types`; if none fit, set **`change_required: false`** with **`INSUFFICIENT_EVIDENCE`** and explain in **`confidence_notes`**.
+  - If check fails, **do not emit** the invalid SKU. Re-select from `eligible_node_types` using the **Deterministic selection order**; if none fit, set **`change_required: false`** with **`INSUFFICIENT_EVIDENCE`** and explain in **`confidence_notes`**.
 - **No guessed availability:** Never assume workspace availability from Azure family naming alone. Only trust provided `system.compute.node_types` evidence for eligibility.
 
 ---
