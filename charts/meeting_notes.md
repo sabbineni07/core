@@ -315,6 +315,113 @@ Push for:
 
 ---
 
+## Access controls, guardrails, and identity model for users and agents
+
+### Why this deserves a dedicated discussion
+
+AI platform maturity is not only about models, cost, and monitoring. It also depends on whether the platform can enforce who is allowed to use which AI capabilities, which data sources can be accessed, and what an agent is permitted to do on behalf of a user or a system.
+
+This is especially important for agentic workflows because agents can combine model access, data access, and tool execution in a single flow. Without clear identity and permission boundaries, the organization can create security, compliance, and operational risk very quickly.
+
+### Core control areas to discuss
+
+#### 1. User access to AI features
+
+Leadership should understand whether access to AI features is controlled by role, group, environment, or workspace. The key question is whether all users have the same access or whether access is tiered based on business need and risk level.
+
+Important controls include:
+
+- Role-based access to notebooks, SQL, dashboards, model endpoints, and agent features
+- Separate permissions for experimentation, pre-production, and production environments
+- Approval or enablement process for higher-risk AI features
+- Usage visibility by user, team, or department
+
+#### 2. Data access controls and ACLs
+
+AI tools should not bypass normal enterprise data controls. If a user or agent can ask natural-language questions over governed data, the same underlying permissions still need to apply.
+
+Important controls include:
+
+- Table, schema, volume, and function permissions
+- Access controls on retrieval corpora, vector indexes, and knowledge sources
+- Row-level and column-level protections for sensitive data
+- Policy enforcement for regulated, confidential, or restricted datasets
+- Auditability for which users or agents accessed which data
+
+#### 3. Agent identity and execution boundaries
+
+One of the most important design questions is: under what identity does an agent act?
+
+The organization should explicitly define whether agents operate:
+
+- Under the requesting user's identity
+- Under a shared service principal or managed identity
+- Under a delegated model where some actions run as the user and others run as a controlled system identity
+
+This matters because the wrong identity model can either overexpose data or make the agent too constrained to be useful.
+
+#### 4. Tool and action permissions for agents
+
+Agents should not automatically have access to every available tool or action. Tool use should be scoped based on the job the agent is expected to perform.
+
+Important controls include:
+
+- Allowlists for which tools an agent can invoke
+- Restrictions on write, delete, or externally connected actions
+- Separation between read-only analytical agents and action-taking agents
+- Human approval for high-risk or irreversible operations
+- Logging of tool calls, decisions, and outcomes
+
+#### 5. Guardrails for safe AI usage
+
+Guardrails are not the same as access controls. Access controls decide who can use a capability; guardrails decide what behavior is allowed once the capability is used.
+
+Important guardrail topics include:
+
+- Harmful content detection and blocking
+- PII detection, masking, redaction, or blocking
+- Prompt injection and jailbreak protections
+- Restrictions on unsafe tool usage or unapproved data exfiltration
+- Policy enforcement for model inputs and outputs
+
+### What good looks like
+
+A mature platform should support all of the following:
+
+- Users only see and use AI features appropriate to their role
+- Agents do not inherit broader permissions than the user or approved service identity allows
+- Data access remains governed by enterprise ACLs and policies
+- High-risk tools and workflows require additional controls or approvals
+- Guardrails are applied consistently across experimentation and production
+- Logs and traces make it possible to investigate who accessed what and why
+
+### Warning signs to watch for
+
+These are signs that the access and governance model is still immature:
+
+- A single broad permission unlocks most AI capabilities for everyone
+- Agents can access data sources that the requesting user could not access directly
+- Tool permissions are implicit rather than explicitly allowed
+- Production agents use shared credentials with excessive privileges
+- Sensitive data can be exposed through prompts, context windows, or responses
+- There is no audit trail linking AI actions back to a user, role, or service identity
+
+### Questions to ask Databricks specifically
+
+- How are AI capabilities controlled for different user groups and environments?
+- How do Unity Catalog permissions apply when users or agents access governed data through AI features?
+- Can agent access be limited to specific datasets, tools, endpoints, or actions?
+- How are vector indexes, retrieval sources, and model endpoints protected?
+- What identity model is used when an agent acts on behalf of a user?
+- What audit logs exist for prompts, data access, tool calls, and model responses?
+- Which guardrails are available for harmful content, PII, prompt injection, and unsafe outputs?
+
+### Leadership takeaway
+
+**The real test of platform maturity is not whether users and agents can access AI features. It is whether they can do so within clear identity boundaries, governed data permissions, and enforceable safety controls.**
+
+---
+
 ## Databricks vs Azure AI Foundry: where each fits best
 
 ### Recommended framing
@@ -462,3 +569,31 @@ If both needs are strategic, the right answer may be a deliberate platform split
 **The goal is not just more AI activity. The goal is governed, measurable, and resilient AI at scale.**
 
 Databricks should be evaluated not only on feature breadth, but on whether it helps the organization industrialize AI responsibly across cost, engineering process, and operational resilience.
+
+---
+
+## Appendix: explanation of AI control model points
+
+### Experimentation / sandbox
+
+- `Broad access for low-risk experimentation` means teams can try ideas quickly without waiting for a full production approval process.
+- `Budget caps and quotas` means usage is limited so experiments do not create uncontrolled spend.
+- `Lower service expectations` means sandbox environments do not need the same uptime, latency, or support commitments as production.
+- `Non-sensitive or masked data` means experiments should avoid exposing confidential or regulated information.
+- `Rapid iteration with clear expiration or review points` means teams can move fast, but experiments must be reviewed, promoted, or shut down within a defined window.
+
+### Pre-production
+
+- `Approved model patterns` means only vetted models, architectures, or provider configurations should be used before production release.
+- `Evaluation datasets and benchmark tasks` means teams should test behavior against known examples before go-live.
+- `Trace capture and review workflows` means requests, responses, and execution steps should be logged so reviewers can inspect system behavior.
+- `Defined owner and success criteria` means every use case should have a named accountable owner and a clear definition of acceptable performance.
+- `Security and compliance checks` means legal, security, privacy, and policy requirements must be validated before promotion.
+
+### Production
+
+- `Formal promotion and approval path` means production deployment should happen through a controlled release process rather than ad hoc publishing.
+- `Rate limits and concurrency controls` means the system should restrict load to prevent abuse, runaway cost, or instability.
+- `Guardrails for harmful content and PII handling` means the platform should detect or block unsafe outputs and protect sensitive data.
+- `Monitoring, alerting, and rollback plan` means teams must be able to detect issues quickly and revert safely if behavior degrades.
+- `SLOs, ownership, and runbooks` means production services need reliability targets, clear accountability, and documented response procedures.
