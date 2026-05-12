@@ -315,6 +315,110 @@ Push for:
 
 ---
 
+## Databricks vs Azure AI Foundry: where each fits best
+
+### Recommended framing
+
+This should not be positioned as a simple "pick one winner" comparison. A better leadership question is:
+
+**Which platform should be the center of gravity for each layer of the AI stack?**
+
+The two platforms overlap in some areas, but they are optimized for different strengths. In many enterprises, the right answer is a deliberate split of responsibilities rather than full replacement of one by the other.
+
+### Where Databricks is a better fit
+
+Databricks is typically the better choice when the use case is data-platform-first and the primary challenge is governing, preparing, and operationalizing enterprise data for AI.
+
+Databricks is strongest when:
+
+- The data already lives in the lakehouse or is processed through Databricks pipelines
+- The use case depends on governed enterprise data, lineage, and access controls
+- Teams need large-scale data engineering, chunking, enrichment, or batch inference
+- AI workflows need to sit close to analytics, ML, notebooks, SQL, and pipelines
+- The organization wants one operating model across data engineering, ML, and GenAI operations
+
+Typical Databricks-first scenarios:
+
+- Enterprise RAG over internal documents, knowledge bases, and structured data
+- Batch enrichment, extraction, classification, and document processing
+- Model serving tightly coupled with data pipelines
+- AI use cases led by data engineering, analytics engineering, or data science teams
+- AI platforms where cost attribution, lineage, and governed data access are top priorities
+
+### Where Azure AI Foundry is a better fit
+
+Azure AI Foundry is typically the better choice when the use case is AI-app-and-agent-first and the primary challenge is rapidly building, evaluating, and governing user-facing AI applications.
+
+Foundry is strongest when:
+
+- Teams want rapid access to many models and providers in one place
+- The use case centers on copilots, assistants, or agentic applications
+- The team needs fast prompt, agent, and tool orchestration cycles
+- Azure-native integration across identity, networking, security, and application services is important
+- Application teams are building user-facing experiences rather than data-platform-centric workflows
+
+Typical Foundry-first scenarios:
+
+- Conversational assistants and copilots
+- Multi-model experimentation and model comparisons
+- Agent workflows with tool use and application integration
+- Prompt-centric application development
+- User-facing AI products that need strong app-layer safety and observability controls
+
+### Best-fit model: split responsibility
+
+In many organizations, the strongest operating model is:
+
+- `Databricks` as the governed data and AI operations backbone
+- `Azure AI Foundry` as the AI application and agent delivery layer
+
+A practical split can look like this:
+
+- Data ingestion, cleansing, chunking, embeddings pipelines, retrieval corpora, and lineage remain in Databricks
+- Prompt orchestration, agent composition, model experimentation, and user-facing AI app development happen in Foundry
+
+This model works best when the organization clearly defines ownership and avoids duplicate control planes.
+
+### Key risk if both are used without boundaries
+
+The main risk is not choosing the wrong tool. The main risk is overlapping platform responsibilities, which can create:
+
+- Duplicate model gateways and policy layers
+- Inconsistent evaluation and monitoring standards
+- Unclear ownership of production promotion
+- Harder cost attribution and financial visibility
+- Different security and governance practices across teams
+
+### Decision guidance for leadership
+
+Use a Databricks-first approach when:
+
+- The use case is deeply tied to enterprise data pipelines
+- The primary users are data engineers, analytics engineers, and data scientists
+- Governance around tables, lineage, and data access is the top concern
+- The workload is batch-heavy, lakehouse-centric, or closely tied to ML workflows
+
+Use a Foundry-first approach when:
+
+- The use case is a conversational or agentic application
+- The primary users are application or AI product teams
+- Rapid model experimentation and orchestration matter most
+- Azure-native agent tooling and application integration are critical
+
+Use both when:
+
+- Enterprise data preparation must remain governed in Databricks
+- The final user-facing application experience is better served by Foundry
+- The organization can define a clean handoff between the data platform and the AI application platform
+
+### Suggested leadership message
+
+**Databricks should be evaluated as the foundation for data-centric AI industrialization. Azure AI Foundry should be evaluated as the platform for agent and application-centric AI delivery.**
+
+If both needs are strategic, the right answer may be a deliberate platform split rather than a forced replacement decision.
+
+---
+
 ## Strong questions to ask in the meeting
 
 - Do we have a full inventory of AI use cases, owners, and environments?
